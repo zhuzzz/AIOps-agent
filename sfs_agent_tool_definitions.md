@@ -13,23 +13,30 @@
   │
   │  ← Agent 根据告警时间确定诊断时间窗: [告警首次触发前30min, 当前时间]
   │
-  ├─ [get_service_topology]        获取 SFS 拓扑快照 + 依赖健康度 (一次拿全)
-  ├─ [get_service_instances]       获取故障时段 SFS 全部实例状态
-  ├─ [query_alarms]                拉取时间窗内 SFS 全量告警 (12条)
-  ├─ [cluster_alarms]              告警聚类 → 4 大类（限定时间窗）
+  ├─ [get_service_topology]          获取 SFS 拓扑快照（含实例列表）+ 依赖健康度 (一次拿全)
   │
-  ├─ [create_diagnosis_task] × 4   对每类下发诊断（传入时间窗）
-  ├─ [get_diagnosis_result] × 4    轮询结果 → 全部未找到 SFS 自身根因
+  │  ← 拿到包含时间窗的拓扑图后，并行拉取本服务的全部告警、指标异常、日志
+  ├─┬─ [query_alarms]                并行: 拉取时间窗内 SFS 全量告警 (12条)
+  │ ├─ [detect_metric_anomalies]     并行: 对 SFS 全部实例做指标异常检测
+  │ └─ [query_logs]                  并行: 拉取时间窗内 SFS 关键日志
+  │
+  ├─ [cluster_alarms]                告警聚类 → 4 大类（限定时间窗）
+  │
+  ├─ [create_diagnosis_task] × 4     对每类下发诊断（传入时间窗）
+  ├─ [get_diagnosis_result] × 4      轮询结果 → 全部未找到 SFS 自身根因
   │
   │  ← topology 已返回依赖健康度，Agent 发现 OBS status=DEGRADED, latency_p99=850ms
-  │——根据已有的拓扑快照，诊断obs服务
-  ├─ [query_alarms]                拉取时间窗内 OBS 全量告警 (8条)
-  ├─ [cluster_alarms]              OBS 告警聚类
-  ├─ [create_diagnosis_task]       对 OBS 聚类下发诊断
-  ├─ [get_diagnosis_result]        ✅ 找到根因: obs-store-03 慢盘
+  │——根据已有的拓扑快照，诊断 OBS 服务
+  ├─┬─ [query_alarms]                并行: 拉取时间窗内 OBS 全量告警 (8条)
+  │ ├─ [detect_metric_anomalies]     并行: 对 OBS 全部实例做指标异常检测
+  │ └─ [query_logs]                  并行: 拉取时间窗内 OBS 关键日志
   │
-  ├─ [query_metrics]               拉取时间窗内 OBS 磁盘时延指标作为证据
-  └─ [query_logs]                  拉取时间窗内 OBS 慢盘日志作为证据
+  ├─ [cluster_alarms]                OBS 告警聚类
+  ├─ [create_diagnosis_task]         对 OBS 聚类下发诊断
+  ├─ [get_diagnosis_result]          ✅ 找到根因: obs-store-03 慢盘
+  │
+  ├─ [query_metrics]                 拉取时间窗内 OBS 磁盘时延指标作为证据
+  └─ [query_logs]                    拉取时间窗内 OBS 慢盘日志作为证据
 ```
 
 ---
@@ -47,14 +54,14 @@
 
 | Tool | 时间窗语义 |
 |------|-----------|
-| get_service_topology | 返回窗口内拓扑快照，依赖健康指标（时延/错误率）为窗口内统计值 |
-| get_service_instances | 返回窗口内各实例状态（取最新状态） |
+| get_service_topology | 返回窗口内拓扑快照（含实例列表），依赖健康指标（时延/错误率）为窗口内统计值 |
 | query_alarms | 返回窗口内触发或活跃的告警 |
 | get_alarm_detail | 返回该告警在窗口内的状态快照和值变化趋势 |
 | cluster_alarms | 对窗口内活跃的告警进行聚类分析 |
 | create_diagnosis_task | 诊断引擎在该窗口内分析指标/日志/拓扑 |
 | get_diagnosis_result | 返回诊断结果（窗口已在创建时指定，此处用于校验） |
 | query_metrics | 返回窗口内的时序数据点 |
+| detect_metric_anomalies | 在窗口内对指定服务全部实例做异常检测，返回可能的故障点 |
 | list_metric_definitions | 返回窗口内生效的指标定义和阈值配置 |
 | query_logs | 返回窗口内的日志条目 |
 | get_log_context | 在窗口内获取目标日志的前后上下文 |
@@ -66,13 +73,13 @@
 | # | Tool Name | 用途 |
 |---|-----------|------|
 | 1 | get_service_topology | 获取服务拓扑、元信息、实例列表、上下游依赖及运行时健康度 |
-| 2 | get_service_instances | 获取服务下全部实例详情 |
-| 3 | query_alarms | 按条件查询告警列表 |
-| 4 | get_alarm_detail | 获取单条告警详情 |
-| 5 | cluster_alarms | 告警聚类分析 |
-| 6 | create_diagnosis_task | 创建诊断任务 |
-| 7 | get_diagnosis_result | 查询诊断任务结果 |
-| 8 | query_metrics | 查询时序指标数据 |
+| 2 | query_alarms | 按条件查询告警列表 |
+| 3 | get_alarm_detail | 获取单条告警详情 |
+| 4 | cluster_alarms | 告警聚类分析 |
+| 5 | create_diagnosis_task | 创建诊断任务 |
+| 6 | get_diagnosis_result | 查询诊断任务结果 |
+| 7 | query_metrics | 查询时序指标数据 |
+| 8 | detect_metric_anomalies | 基于指标做异常检测，返回可能的故障点 |
 | 9 | list_metric_definitions | 获取可用指标清单 |
 | 10 | query_logs | 查询日志 |
 | 11 | get_log_context | 获取日志上下文 |
@@ -88,7 +95,7 @@
   "type": "function",
   "function": {
     "name": "get_service_topology",
-    "description": "获取指定时间窗内的服务拓扑快照，一次返回服务元信息、实例列表和上下游依赖关系。依赖关系包含运行时健康指标（P99时延、错误率、基线对比），Agent 可直接判断哪个依赖异常，无需额外调用。可通过 direction 控制查询上游/下游，通过 depth 控制递归展开深度。当本服务诊断未找到根因时，Agent 应从返回的 downstream_dependencies 中选择 status=DEGRADED 且 dependency_type=STRONG 的服务继续追溯。",
+    "description": "获取指定时间窗内的服务拓扑快照，一次返回服务元信息、实例列表（含状态、角色、宿主机信息）和上下游依赖关系。依赖关系包含运行时健康指标（P99时延、错误率、基线对比），Agent 可直接判断哪个依赖异常，无需额外调用。可通过 direction 控制查询上游/下游，通过 depth 控制递归展开深度。当本服务诊断未找到根因时，Agent 应从返回的 downstream_dependencies 中选择 status=DEGRADED 且 dependency_type=STRONG 的服务继续追溯。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -152,10 +159,14 @@
   "status": "DEGRADED",
   "topology_snapshot_time": "2025-03-05T10:30:00Z",
   "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
-  "instance_ids": [
-    "sfs-node-01", "sfs-node-02", "sfs-node-03",
-    "sfs-proxy-01", "sfs-proxy-02",
-    "sfs-meta-01", "sfs-meta-02"
+  "instances": [
+    {"instance_id": "sfs-node-01", "instance_name": "SFS存储节点-01", "instance_type": "SFS_STORAGE", "status": "RUNNING", "role": "MASTER", "host_info": {"ecs_instance_id": "i-abcdef001", "private_ip": "192.168.1.101", "az": "cn-north-4a"}},
+    {"instance_id": "sfs-node-02", "instance_name": "SFS存储节点-02", "instance_type": "SFS_STORAGE", "status": "DEGRADED", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-abcdef002", "private_ip": "192.168.1.102", "az": "cn-north-4a"}},
+    {"instance_id": "sfs-node-03", "instance_name": "SFS存储节点-03", "instance_type": "SFS_STORAGE", "status": "RUNNING", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-abcdef003", "private_ip": "192.168.1.103", "az": "cn-north-4b"}},
+    {"instance_id": "sfs-proxy-01", "instance_name": "SFS协议代理-01", "instance_type": "SFS_PROXY", "status": "RUNNING", "role": "PROXY", "host_info": {"ecs_instance_id": "i-abcdef004", "private_ip": "192.168.1.111", "az": "cn-north-4a"}},
+    {"instance_id": "sfs-proxy-02", "instance_name": "SFS协议代理-02", "instance_type": "SFS_PROXY", "status": "RUNNING", "role": "PROXY", "host_info": {"ecs_instance_id": "i-abcdef005", "private_ip": "192.168.1.112", "az": "cn-north-4b"}},
+    {"instance_id": "sfs-meta-01", "instance_name": "SFS元数据节点-01", "instance_type": "SFS_METADATA", "status": "RUNNING", "role": "MASTER", "host_info": {"ecs_instance_id": "i-abcdef006", "private_ip": "192.168.1.121", "az": "cn-north-4a"}},
+    {"instance_id": "sfs-meta-02", "instance_name": "SFS元数据节点-02", "instance_type": "SFS_METADATA", "status": "RUNNING", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-abcdef007", "private_ip": "192.168.1.122", "az": "cn-north-4b"}}
   ],
   "downstream_dependencies": [
     {
@@ -237,9 +248,12 @@
   "status": "DEGRADED",
   "topology_snapshot_time": "2025-03-05T10:30:00Z",
   "time_range": {"start": "2025-03-05T08:00:00Z", "end": "2025-03-05T11:00:00Z"},
-  "instance_ids": [
-    "obs-gw-01", "obs-gw-02",
-    "obs-store-01", "obs-store-02", "obs-store-03"
+  "instances": [
+    {"instance_id": "obs-gw-01", "instance_name": "OBS网关-01", "instance_type": "OBS_GATEWAY", "status": "RUNNING", "role": "GATEWAY", "host_info": {"ecs_instance_id": "i-obs001", "private_ip": "192.168.2.101", "az": "cn-north-4a"}},
+    {"instance_id": "obs-gw-02", "instance_name": "OBS网关-02", "instance_type": "OBS_GATEWAY", "status": "RUNNING", "role": "GATEWAY", "host_info": {"ecs_instance_id": "i-obs002", "private_ip": "192.168.2.102", "az": "cn-north-4b"}},
+    {"instance_id": "obs-store-01", "instance_name": "OBS存储节点-01", "instance_type": "OBS_STORAGE", "status": "RUNNING", "role": "MASTER", "host_info": {"ecs_instance_id": "i-obs003", "private_ip": "192.168.2.111", "az": "cn-north-4a"}},
+    {"instance_id": "obs-store-02", "instance_name": "OBS存储节点-02", "instance_type": "OBS_STORAGE", "status": "RUNNING", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-obs004", "private_ip": "192.168.2.112", "az": "cn-north-4a"}},
+    {"instance_id": "obs-store-03", "instance_name": "OBS存储节点-03", "instance_type": "OBS_STORAGE", "status": "DEGRADED", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-obs005", "private_ip": "192.168.2.113", "az": "cn-north-4a"}}
   ],
   "downstream_dependencies": [
     {
@@ -273,213 +287,7 @@
 
 ---
 
-### Tool 2: get_service_instances
-
-```json
-{
-  "type": "function",
-  "function": {
-    "name": "get_service_instances",
-    "description": "获取指定服务在指定时间窗内的全部实例详细信息，包括实例状态、宿主机信息、角色、资源配置和连接关系。实例状态取时间窗内最新值，连接状态为窗口内聚合判定。",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "service_id": {
-          "type": "string",
-          "description": "服务唯一标识"
-        },
-        "time_range_start": {
-          "type": "string",
-          "description": "时间窗起始，ISO 8601"
-        },
-        "time_range_end": {
-          "type": "string",
-          "description": "时间窗结束，ISO 8601"
-        },
-        "status_filter": {
-          "type": "array",
-          "items": {"type": "string", "enum": ["RUNNING", "DEGRADED", "FAULT", "STOPPED"]},
-          "description": "按实例状态过滤，不传则返回全部"
-        },
-        "role_filter": {
-          "type": "array",
-          "items": {"type": "string", "enum": ["MASTER", "SLAVE", "PROXY", "GATEWAY"]},
-          "description": "按实例角色过滤"
-        }
-      },
-      "required": ["service_id", "time_range_start", "time_range_end"]
-    }
-  }
-}
-```
-
-#### Mock 调用
-
-**Agent 调用参数：**
-```json
-{
-  "service_id": "sfs-turbo-001",
-  "time_range_start": "2025-03-05T09:00:00Z",
-  "time_range_end": "2025-03-05T11:00:00Z"
-}
-```
-
-**Mock 返回：**
-```json
-{
-  "total": 7,
-  "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
-  "instances": [
-    {
-      "instance_id": "sfs-node-01",
-      "instance_name": "SFS存储节点-01",
-      "service_id": "sfs-turbo-001",
-      "instance_type": "SFS_STORAGE",
-      "status": "RUNNING",
-      "status_during_window": ["RUNNING", "RUNNING"],
-      "host_info": {
-        "ecs_instance_id": "i-abcdef001",
-        "private_ip": "192.168.1.101",
-        "az": "cn-north-4a",
-        "host_name": "sfs-store-01"
-      },
-      "role": "MASTER",
-      "connections": [
-        {
-          "target_instance_id": "obs-gw-01",
-          "target_service_id": "obs-bucket-train-data",
-          "connection_type": "OBS_API",
-          "port": 443,
-          "status": "DEGRADED"
-        }
-      ],
-      "resources": {"cpu_cores": 64, "memory_gb": 256, "disk_gb": 20000, "network_bandwidth_mbps": 25000}
-    },
-    {
-      "instance_id": "sfs-node-02",
-      "instance_name": "SFS存储节点-02",
-      "service_id": "sfs-turbo-001",
-      "instance_type": "SFS_STORAGE",
-      "status": "DEGRADED",
-      "status_during_window": ["RUNNING", "DEGRADED"],
-      "host_info": {
-        "ecs_instance_id": "i-abcdef002",
-        "private_ip": "192.168.1.102",
-        "az": "cn-north-4a",
-        "host_name": "sfs-store-02"
-      },
-      "role": "SLAVE",
-      "connections": [
-        {
-          "target_instance_id": "obs-gw-01",
-          "target_service_id": "obs-bucket-train-data",
-          "connection_type": "OBS_API",
-          "port": 443,
-          "status": "DEGRADED"
-        }
-      ],
-      "resources": {"cpu_cores": 64, "memory_gb": 256, "disk_gb": 20000, "network_bandwidth_mbps": 25000}
-    },
-    {
-      "instance_id": "sfs-node-03",
-      "instance_name": "SFS存储节点-03",
-      "service_id": "sfs-turbo-001",
-      "instance_type": "SFS_STORAGE",
-      "status": "RUNNING",
-      "status_during_window": ["RUNNING", "RUNNING"],
-      "host_info": {
-        "ecs_instance_id": "i-abcdef003",
-        "private_ip": "192.168.1.103",
-        "az": "cn-north-4b",
-        "host_name": "sfs-store-03"
-      },
-      "role": "SLAVE",
-      "connections": [
-        {
-          "target_instance_id": "obs-gw-02",
-          "target_service_id": "obs-bucket-train-data",
-          "connection_type": "OBS_API",
-          "port": 443,
-          "status": "NORMAL"
-        }
-      ],
-      "resources": {"cpu_cores": 64, "memory_gb": 256, "disk_gb": 20000, "network_bandwidth_mbps": 25000}
-    },
-    {
-      "instance_id": "sfs-proxy-01",
-      "instance_name": "SFS协议代理-01",
-      "service_id": "sfs-turbo-001",
-      "instance_type": "SFS_PROXY",
-      "status": "RUNNING",
-      "status_during_window": ["RUNNING", "RUNNING"],
-      "host_info": {
-        "ecs_instance_id": "i-abcdef004",
-        "private_ip": "192.168.1.111",
-        "az": "cn-north-4a",
-        "host_name": "sfs-proxy-01"
-      },
-      "role": "PROXY",
-      "connections": [],
-      "resources": {"cpu_cores": 32, "memory_gb": 64, "disk_gb": 500, "network_bandwidth_mbps": 25000}
-    },
-    {
-      "instance_id": "sfs-proxy-02",
-      "instance_name": "SFS协议代理-02",
-      "service_id": "sfs-turbo-001",
-      "instance_type": "SFS_PROXY",
-      "status": "RUNNING",
-      "status_during_window": ["RUNNING", "RUNNING"],
-      "host_info": {
-        "ecs_instance_id": "i-abcdef005",
-        "private_ip": "192.168.1.112",
-        "az": "cn-north-4b",
-        "host_name": "sfs-proxy-02"
-      },
-      "role": "PROXY",
-      "connections": [],
-      "resources": {"cpu_cores": 32, "memory_gb": 64, "disk_gb": 500, "network_bandwidth_mbps": 25000}
-    },
-    {
-      "instance_id": "sfs-meta-01",
-      "instance_name": "SFS元数据节点-01",
-      "service_id": "sfs-turbo-001",
-      "instance_type": "SFS_METADATA",
-      "status": "RUNNING",
-      "status_during_window": ["RUNNING", "RUNNING"],
-      "host_info": {
-        "ecs_instance_id": "i-abcdef006",
-        "private_ip": "192.168.1.121",
-        "az": "cn-north-4a",
-        "host_name": "sfs-meta-01"
-      },
-      "role": "MASTER",
-      "connections": [],
-      "resources": {"cpu_cores": 16, "memory_gb": 64, "disk_gb": 2000, "network_bandwidth_mbps": 10000}
-    },
-    {
-      "instance_id": "sfs-meta-02",
-      "instance_name": "SFS元数据节点-02",
-      "service_id": "sfs-turbo-001",
-      "instance_type": "SFS_METADATA",
-      "status": "RUNNING",
-      "status_during_window": ["RUNNING", "RUNNING"],
-      "host_info": {
-        "ecs_instance_id": "i-abcdef007",
-        "private_ip": "192.168.1.122",
-        "az": "cn-north-4b",
-        "host_name": "sfs-meta-02"
-      },
-      "role": "SLAVE",
-      "connections": [],
-      "resources": {"cpu_cores": 16, "memory_gb": 64, "disk_gb": 2000, "network_bandwidth_mbps": 10000}
-    }
-  ]
-}
-```
-
----
-
-### Tool 3: query_alarms
+### Tool 2: query_alarms
 
 ```json
 {
@@ -597,7 +405,7 @@
 
 ---
 
-### Tool 4: get_alarm_detail
+### Tool 3: get_alarm_detail
 
 ```json
 {
@@ -673,7 +481,7 @@
 
 ---
 
-### Tool 5: cluster_alarms
+### Tool 4: cluster_alarms
 
 ```json
 {
@@ -742,7 +550,7 @@
 
 ---
 
-### Tool 6: create_diagnosis_task
+### Tool 5: create_diagnosis_task
 
 ```json
 {
@@ -817,7 +625,7 @@
 
 ---
 
-### Tool 7: get_diagnosis_result
+### Tool 6: get_diagnosis_result
 
 ```json
 {
@@ -945,7 +753,7 @@
 
 ---
 
-### Tool 8: query_metrics
+### Tool 7: query_metrics
 
 ```json
 {
@@ -1050,6 +858,213 @@
         {"timestamp": "2025-03-05T10:45:00Z", "value": 385.0}
       ],
       "statistics": {"avg": 222.61, "max": 385.0, "min": 4.5, "p50": 280.5, "p99": 385.0}
+    }
+  ]
+}
+```
+
+---
+
+### Tool 8: detect_metric_anomalies
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "detect_metric_anomalies",
+    "description": "对指定服务在时间窗内的全部实例执行指标异常检测。自动拉取该服务类型的所有关键指标，与历史基线对比，返回检测到的异常列表及可能的故障判定。Agent 可在拿到拓扑后立即并行调用此 Tool，快速获取指标层面的异常概览，辅助后续诊断决策。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "service_id": {
+          "type": "string",
+          "description": "服务唯一标识"
+        },
+        "instance_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "待检测的实例ID列表，不传则检测该服务全部实例"
+        },
+        "time_range_start": {
+          "type": "string",
+          "description": "时间窗起始，ISO 8601"
+        },
+        "time_range_end": {
+          "type": "string",
+          "description": "时间窗结束，ISO 8601"
+        },
+        "sensitivity": {
+          "type": "string",
+          "enum": ["LOW", "MEDIUM", "HIGH"],
+          "description": "异常检测灵敏度，HIGH 会返回更多弱异常",
+          "default": "MEDIUM"
+        }
+      },
+      "required": ["service_id", "time_range_start", "time_range_end"]
+    }
+  }
+}
+```
+
+#### Mock 调用 A — SFS 指标异常检测
+
+**Agent 调用参数：**
+```json
+{
+  "service_id": "sfs-turbo-001",
+  "time_range_start": "2025-03-05T09:00:00Z",
+  "time_range_end": "2025-03-05T11:00:00Z",
+  "sensitivity": "MEDIUM"
+}
+```
+
+**Mock 返回：**
+```json
+{
+  "service_id": "sfs-turbo-001",
+  "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
+  "total_metrics_checked": 42,
+  "anomaly_count": 8,
+  "anomalies": [
+    {
+      "metric_name": "sfs_nfs_read_latency_ms",
+      "instance_id": "sfs-node-01",
+      "anomaly_type": "SPIKE",
+      "severity": "CRITICAL",
+      "current_value": 320.5,
+      "baseline_value": 10.0,
+      "threshold": 50.0,
+      "deviation_factor": 32.05,
+      "anomaly_start_time": "2025-03-05T09:15:00Z",
+      "description": "NFS 读时延飙升至基线 32 倍"
+    },
+    {
+      "metric_name": "sfs_backend_obs_timeout_rate",
+      "instance_id": "sfs-node-01",
+      "anomaly_type": "SPIKE",
+      "severity": "CRITICAL",
+      "current_value": 0.15,
+      "baseline_value": 0.001,
+      "threshold": 0.01,
+      "deviation_factor": 150.0,
+      "anomaly_start_time": "2025-03-05T09:12:00Z",
+      "description": "OBS 后端超时率飙升至基线 150 倍"
+    },
+    {
+      "metric_name": "sfs_throughput_mbps",
+      "instance_id": "sfs-node-01",
+      "anomaly_type": "DROP",
+      "severity": "MAJOR",
+      "current_value": 800,
+      "baseline_value": 5000,
+      "threshold": 1000,
+      "deviation_factor": 0.16,
+      "anomaly_start_time": "2025-03-05T09:20:00Z",
+      "description": "吞吐量下降 84%"
+    },
+    {
+      "metric_name": "sfs_io_queue_depth",
+      "instance_id": "sfs-node-01",
+      "anomaly_type": "SPIKE",
+      "severity": "MAJOR",
+      "current_value": 512,
+      "baseline_value": 16,
+      "threshold": 128,
+      "deviation_factor": 32.0,
+      "anomaly_start_time": "2025-03-05T09:25:00Z",
+      "description": "IO 队列深度飙升"
+    }
+  ],
+  "possible_faults": [
+    {
+      "fault_type": "BACKEND_DEPENDENCY_DEGRADATION",
+      "confidence": 0.85,
+      "description": "后端 OBS 依赖异常导致 SFS IO 链路整体劣化",
+      "related_anomalies": ["sfs_backend_obs_timeout_rate", "sfs_nfs_read_latency_ms", "sfs_throughput_mbps", "sfs_io_queue_depth"],
+      "affected_instances": ["sfs-node-01", "sfs-node-02"],
+      "suggestion": "优先排查下游 OBS 服务状态"
+    }
+  ]
+}
+```
+
+#### Mock 调用 B — OBS 指标异常检测
+
+**Agent 调用参数：**
+```json
+{
+  "service_id": "obs-bucket-train-data",
+  "time_range_start": "2025-03-05T08:00:00Z",
+  "time_range_end": "2025-03-05T11:00:00Z",
+  "sensitivity": "MEDIUM"
+}
+```
+
+**Mock 返回：**
+```json
+{
+  "service_id": "obs-bucket-train-data",
+  "time_range": {"start": "2025-03-05T08:00:00Z", "end": "2025-03-05T11:00:00Z"},
+  "total_metrics_checked": 30,
+  "anomaly_count": 6,
+  "anomalies": [
+    {
+      "metric_name": "obs_disk_latency_p99_ms",
+      "instance_id": "obs-store-03",
+      "anomaly_type": "SPIKE",
+      "severity": "CRITICAL",
+      "current_value": 385.0,
+      "baseline_value": 5.0,
+      "threshold": 10.0,
+      "deviation_factor": 77.0,
+      "anomaly_start_time": "2025-03-05T08:55:00Z",
+      "description": "磁盘 P99 时延飙升至基线 77 倍，疑似慢盘"
+    },
+    {
+      "metric_name": "obs_disk_smart_health_score",
+      "instance_id": "obs-store-03",
+      "anomaly_type": "DROP",
+      "severity": "CRITICAL",
+      "current_value": 42.0,
+      "baseline_value": 98.0,
+      "threshold": 60.0,
+      "deviation_factor": 0.43,
+      "anomaly_start_time": "2025-03-05T08:30:00Z",
+      "description": "SMART 健康评分骤降至 42%"
+    },
+    {
+      "metric_name": "obs_iowait_percent",
+      "instance_id": "obs-store-03",
+      "anomaly_type": "SPIKE",
+      "severity": "MAJOR",
+      "current_value": 65.0,
+      "baseline_value": 5.0,
+      "threshold": 30.0,
+      "deviation_factor": 13.0,
+      "anomaly_start_time": "2025-03-05T09:05:00Z",
+      "description": "IO Wait 飙升至 65%"
+    },
+    {
+      "metric_name": "obs_put_latency_p99_ms",
+      "instance_id": "obs-gw-01",
+      "anomaly_type": "SPIKE",
+      "severity": "CRITICAL",
+      "current_value": 620.0,
+      "baseline_value": 10.0,
+      "threshold": 50.0,
+      "deviation_factor": 62.0,
+      "anomaly_start_time": "2025-03-05T09:10:00Z",
+      "description": "PUT P99 时延飙升"
+    }
+  ],
+  "possible_faults": [
+    {
+      "fault_type": "DISK_HARDWARE_DEGRADATION",
+      "confidence": 0.92,
+      "description": "obs-store-03 磁盘硬件劣化（慢盘），SMART 健康评分骤降 + 磁盘时延飙升 + IO Wait 升高，影响 OBS 整体读写性能",
+      "related_anomalies": ["obs_disk_latency_p99_ms", "obs_disk_smart_health_score", "obs_iowait_percent", "obs_put_latency_p99_ms"],
+      "affected_instances": ["obs-store-03"],
+      "suggestion": "紧急迁移 obs-store-03 数据至健康节点，更换故障磁盘"
     }
   ]
 }
@@ -1274,6 +1289,8 @@
 ## 5. Agent 编排伪代码
 
 ```python
+import asyncio
+
 def agent_diagnose(trigger_alarm):
     """Agent 主循环：所有 Tool 调用均传入统一时间窗"""
 
@@ -1296,31 +1313,39 @@ def agent_diagnose(trigger_alarm):
             direction="BOTH"
         )
 
-        # 2. 查实例详情（可选，需要连接级信息时调用）
-        instances = get_service_instances(
-            service_id=service_id,
-            time_range_start=window_start,
-            time_range_end=window_end
+        # 2. 拿到拓扑后，并行拉取告警、指标异常、日志
+        instance_ids = [inst["instance_id"] for inst in topology["instances"]]
+        alarms, anomalies, logs = asyncio.gather(
+            query_alarms(
+                service_id=service_id,
+                time_range_start=window_start,
+                time_range_end=window_end,
+                status=["FIRING"]
+            ),
+            detect_metric_anomalies(
+                service_id=service_id,
+                time_range_start=window_start,
+                time_range_end=window_end
+            ),
+            query_logs(
+                service_id=service_id,
+                time_range_start=window_start,
+                time_range_end=window_end,
+                levels=["ERROR", "WARN"]
+            )
         )
 
-        # 3. 拉告警
-        alarms = query_alarms(
-            service_id=service_id,
-            time_range_start=window_start,
-            time_range_end=window_end,
-            status=["FIRING"]
-        )
         if alarms["total"] == 0:
             break
 
-        # 4. 聚类
+        # 3. 告警聚类
         clusters = cluster_alarms(
             alarm_ids=[a["alarm_id"] for a in alarms["alarms"]],
             time_range_start=window_start,
             time_range_end=window_end
         )
 
-        # 5. 对每个聚类下发诊断
+        # 4. 对每个聚类下发诊断
         root_cause_found = False
         for cluster in clusters["clusters"]:
             task = create_diagnosis_task(
@@ -1339,11 +1364,12 @@ def agent_diagnose(trigger_alarm):
 
             if result["result"]["root_cause_found"]:
                 root_cause_found = True
-                metrics = query_metrics(...)   # 采集证据
-                logs = query_logs(...)
-                return build_report(result, metrics, logs)
+                evidence_metrics = query_metrics(...)   # 采集证据
+                evidence_logs = query_logs(...)
+                return build_report(result, evidence_metrics, evidence_logs, anomalies)
 
-        # 6. 全部无根因 → 从 topology 返回的依赖中选择嫌疑最大的
+        # 5. 全部无根因 → 从 topology 返回的依赖中选择嫌疑最大的
+        #    同时参考 anomalies.possible_faults 辅助判断
         if not root_cause_found:
             deps = topology["downstream_dependencies"]
             suspect = pick_most_suspicious(deps)  # status=DEGRADED + STRONG 优先
