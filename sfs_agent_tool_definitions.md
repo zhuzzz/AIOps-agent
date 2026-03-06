@@ -9,11 +9,11 @@
 **Agent 诊断流程**：
 
 ```
-收到 SFS 告警 (含 ECS instanceID, 时间戳)
+收到 SFS 告警 (含 SFS instanceID, 时间戳)
   │
   │  ← Agent 根据告警时间确定诊断时间窗: [告警首次触发前30min, 当前时间]
   │
-  ├─ [get_service_topology]          获取 SFS 拓扑快照（含实例列表）+ 依赖健康度 (一次拿全)
+  ├─ [get_service_topology]          通过 instance_id 反查所属服务，获取拓扑快照 + 实例纵向依赖链(SFS→ECS→EVS) + metric_pointer (一次拿全)
   │
   │  ← 拿到包含时间窗的拓扑图后，并行拉取本服务的全部告警、指标异常、日志
   ├─┬─ [query_alarms]                并行: 拉取时间窗内 SFS 全量告警 (12条)
@@ -72,7 +72,7 @@
 
 | # | Tool Name | 用途 |
 |---|-----------|------|
-| 1 | get_service_topology | 获取服务拓扑、元信息、实例列表、上下游依赖及运行时健康度 |
+| 1 | get_service_topology | 通过 service_id 或 instance_id 获取服务拓扑、实例纵向依赖链（SFS→ECS→EVS）、metric_pointer 及运行时健康度 |
 | 2 | query_alarms | 按条件查询告警列表 |
 | 3 | get_alarm_detail | 获取单条告警详情 |
 | 4 | cluster_alarms | 告警聚类分析 |
@@ -95,13 +95,17 @@
   "type": "function",
   "function": {
     "name": "get_service_topology",
-    "description": "获取指定时间窗内的服务拓扑快照，一次返回服务元信息、实例列表（含状态、角色、宿主机信息）和上下游依赖关系。依赖关系包含运行时健康指标（P99时延、错误率、基线对比），Agent 可直接判断哪个依赖异常，无需额外调用。可通过 direction 控制查询上游/下游，通过 depth 控制递归展开深度。当本服务诊断未找到根因时，Agent 应从返回的 downstream_dependencies 中选择 status=DEGRADED 且 dependency_type=STRONG 的服务继续追溯。",
+    "description": "获取指定时间窗内的服务拓扑快照。支持两种入口：1) 通过 service_id 查询已知服务；2) 通过 instance_id（如告警中的 SFS instanceID）自动反查所属服务并返回完整拓扑，response 中 queried_instance_id 标记告警实例。两个 ID 至少提供一个，均提供时以 service_id 为主、instance_id 用于定位。\n\n返回内容包含：服务元信息、实例列表（每个实例携带纵向依赖链 underlying_instances: SFS instance → ECS instance → EVS instance）、上下游服务依赖（含运行时健康指标）。每个实体（服务、实例、依赖）均携带 metric_pointer（含 namespace、dimension、log_group_id、log_stream_id、suggested_metrics），Agent 可直接用于后续 query_metrics / query_logs 调用，无需额外查询指标命名空间或日志流 ID。\n\n实例的 underlying_instances 字段描述纵向承载关系：一个 SFS 实例运行在哪个 ECS 实例上，该 ECS 又挂载了哪些 EVS 磁盘，每层均有独立 metric_pointer，支持按层下钻诊断（如 SFS 层面指标正常时，可直接下钻到 ECS cpu_util / EVS disk_io_await）。\n\n当本服务诊断未找到根因时，Agent 应从 downstream_dependencies 中选择 status=DEGRADED 且 dependency_type=STRONG 的服务继续追溯。",
     "parameters": {
       "type": "object",
       "properties": {
         "service_id": {
           "type": "string",
-          "description": "服务唯一标识，如 'sfs-turbo-001'"
+          "description": "服务唯一标识，如 'sfs-turbo-001'。与 instance_id 至少提供一个"
+        },
+        "instance_id": {
+          "type": "string",
+          "description": "实例唯一标识，如 'sfs-node-02'（告警中携带的 SFS instanceID）。提供时自动反查所属服务并返回完整拓扑，response 中 queried_instance_id 标记该实例。与 service_id 至少提供一个"
         },
         "time_range_start": {
           "type": "string",
@@ -124,22 +128,22 @@
         },
         "include_instances": {
           "type": "boolean",
-          "description": "是否包含实例ID列表",
+          "description": "是否包含实例详情列表（含 host_info、underlying_instances、metric_pointer）",
           "default": true
         }
       },
-      "required": ["service_id", "time_range_start", "time_range_end"]
+      "required": ["time_range_start", "time_range_end"]
     }
   }
 }
 ```
 
-#### Mock 调用 A — 首次查询 SFS 拓扑（direction=BOTH）
+#### Mock 调用 A — 通过告警中的 SFS instanceID 查询拓扑（direction=BOTH）
 
 **Agent 调用参数：**
 ```json
 {
-  "service_id": "sfs-turbo-001",
+  "instance_id": "sfs-node-02",
   "time_range_start": "2025-03-05T09:00:00Z",
   "time_range_end": "2025-03-05T11:00:00Z",
   "direction": "BOTH",
@@ -151,75 +155,369 @@
 **Mock 返回：**
 ```json
 {
-  "service_id": "sfs-turbo-001",
-  "service_name": "SFS Turbo 文件存储",
-  "service_type": "SFS_TURBO",
-  "region": "cn-north-4",
-  "az": "cn-north-4a",
-  "status": "DEGRADED",
-  "topology_snapshot_time": "2025-03-05T10:30:00Z",
-  "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
-  "instances": [
-    {"instance_id": "sfs-node-01", "instance_name": "SFS存储节点-01", "instance_type": "SFS_STORAGE", "status": "RUNNING", "role": "MASTER", "host_info": {"ecs_instance_id": "i-abcdef001", "private_ip": "192.168.1.101", "az": "cn-north-4a"}},
-    {"instance_id": "sfs-node-02", "instance_name": "SFS存储节点-02", "instance_type": "SFS_STORAGE", "status": "DEGRADED", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-abcdef002", "private_ip": "192.168.1.102", "az": "cn-north-4a"}},
-    {"instance_id": "sfs-node-03", "instance_name": "SFS存储节点-03", "instance_type": "SFS_STORAGE", "status": "RUNNING", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-abcdef003", "private_ip": "192.168.1.103", "az": "cn-north-4b"}},
-    {"instance_id": "sfs-proxy-01", "instance_name": "SFS协议代理-01", "instance_type": "SFS_PROXY", "status": "RUNNING", "role": "PROXY", "host_info": {"ecs_instance_id": "i-abcdef004", "private_ip": "192.168.1.111", "az": "cn-north-4a"}},
-    {"instance_id": "sfs-proxy-02", "instance_name": "SFS协议代理-02", "instance_type": "SFS_PROXY", "status": "RUNNING", "role": "PROXY", "host_info": {"ecs_instance_id": "i-abcdef005", "private_ip": "192.168.1.112", "az": "cn-north-4b"}},
-    {"instance_id": "sfs-meta-01", "instance_name": "SFS元数据节点-01", "instance_type": "SFS_METADATA", "status": "RUNNING", "role": "MASTER", "host_info": {"ecs_instance_id": "i-abcdef006", "private_ip": "192.168.1.121", "az": "cn-north-4a"}},
-    {"instance_id": "sfs-meta-02", "instance_name": "SFS元数据节点-02", "instance_type": "SFS_METADATA", "status": "RUNNING", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-abcdef007", "private_ip": "192.168.1.122", "az": "cn-north-4b"}}
-  ],
-  "downstream_dependencies": [
-    {
-      "service_id": "obs-bucket-train-data",
-      "service_name": "OBS 训练数据桶",
-      "service_type": "OBS",
-      "dependency_type": "STRONG",
-      "protocol": "HTTP",
-      "status": "DEGRADED",
-      "latency_p99_ms": 850,
-      "latency_baseline_ms": 50,
-      "error_rate": 0.12,
-      "description": "SFS 数据持久化层，窗口内 P99 时延 850ms（基线 50ms）"
+  "queried_instance_id": "sfs-node-02",
+  "topology": {
+    "service_id": "sfs-turbo-001",
+    "service_name": "SFS Turbo 文件存储",
+    "service_type": "SFS_TURBO",
+    "region": "cn-north-4",
+    "az": "cn-north-4a",
+    "status": "DEGRADED",
+    "topology_snapshot_time": "2025-03-05T10:30:00Z",
+    "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
+    "metric_pointer": {
+      "namespace": "SYS.SFS",
+      "dimension_name": "service_id",
+      "dimension_value": "sfs-turbo-001",
+      "log_group_id": "lg-sfs-001",
+      "log_stream_id": "ls-sfs-all",
+      "suggested_metrics": ["nfs_read_ops", "nfs_write_ops", "nfs_read_latency_p99", "nfs_write_latency_p99", "throughput_read_MBps", "throughput_write_MBps"]
     },
-    {
-      "service_id": "evs-sfs-meta",
-      "service_name": "EVS 元数据盘",
-      "service_type": "EVS",
-      "dependency_type": "STRONG",
-      "protocol": "TCP",
-      "status": "NORMAL",
-      "latency_p99_ms": 2,
-      "latency_baseline_ms": 1,
-      "error_rate": 0.0,
-      "description": "元数据存储，窗口内状态正常"
-    },
-    {
-      "service_id": "vpc-subnet-001",
-      "service_name": "VPC 子网",
-      "service_type": "VPC",
-      "dependency_type": "STRONG",
-      "protocol": "TCP",
-      "status": "NORMAL",
-      "latency_p99_ms": 0.5,
-      "latency_baseline_ms": 0.3,
-      "error_rate": 0.0,
-      "description": "网络层，窗口内状态正常"
-    }
-  ],
-  "upstream_dependents": [
-    {
-      "service_id": "ecs-gpu-training-cluster",
-      "service_name": "GPU 训练集群",
-      "service_type": "ECS",
-      "dependency_type": "STRONG",
-      "protocol": "NFS",
-      "status": "DEGRADED",
-      "latency_p99_ms": 325,
-      "latency_baseline_ms": 10,
-      "error_rate": 0.05,
-      "description": "GPU 训练集群挂载 SFS，窗口内 NFS 读时延劣化"
-    }
-  ]
+    "instances": [
+      {
+        "instance_id": "sfs-node-01",
+        "instance_name": "SFS存储节点-01",
+        "instance_type": "SFS_STORAGE",
+        "status": "RUNNING",
+        "role": "MASTER",
+        "host_info": {"ecs_instance_id": "i-abcdef001", "private_ip": "192.168.1.101", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-node-01",
+          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-node-01",
+          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "nfs_op_latency_ms", "connection_count"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-abcdef001", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef001",
+              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef001",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-sfs-node01-sys", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node01-sys",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              },
+              {
+                "instance_id": "vol-sfs-node01-data", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node01-data",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "sfs-node-02",
+        "instance_name": "SFS存储节点-02",
+        "instance_type": "SFS_STORAGE",
+        "status": "DEGRADED",
+        "role": "SLAVE",
+        "host_info": {"ecs_instance_id": "i-abcdef002", "private_ip": "192.168.1.102", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-node-02",
+          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-node-02",
+          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "nfs_op_latency_ms", "connection_count"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-abcdef002", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef002",
+              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef002",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-sfs-node02-sys", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node02-sys",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              },
+              {
+                "instance_id": "vol-sfs-node02-data", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node02-data",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "sfs-node-03",
+        "instance_name": "SFS存储节点-03",
+        "instance_type": "SFS_STORAGE",
+        "status": "RUNNING",
+        "role": "SLAVE",
+        "host_info": {"ecs_instance_id": "i-abcdef003", "private_ip": "192.168.1.103", "az": "cn-north-4b"},
+        "metric_pointer": {
+          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-node-03",
+          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-node-03",
+          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "nfs_op_latency_ms", "connection_count"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-abcdef003", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef003",
+              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef003",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-sfs-node03-sys", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node03-sys",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              },
+              {
+                "instance_id": "vol-sfs-node03-data", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node03-data",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "sfs-proxy-01",
+        "instance_name": "SFS协议代理-01",
+        "instance_type": "SFS_PROXY",
+        "status": "RUNNING",
+        "role": "PROXY",
+        "host_info": {"ecs_instance_id": "i-abcdef004", "private_ip": "192.168.1.111", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-proxy-01",
+          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-proxy-01",
+          "suggested_metrics": ["proxy_connection_count", "proxy_throughput_MBps", "proxy_latency_ms"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-abcdef004", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef004",
+              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef004",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-sfs-proxy01-sys", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-proxy01-sys",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "sfs-proxy-02",
+        "instance_name": "SFS协议代理-02",
+        "instance_type": "SFS_PROXY",
+        "status": "RUNNING",
+        "role": "PROXY",
+        "host_info": {"ecs_instance_id": "i-abcdef005", "private_ip": "192.168.1.112", "az": "cn-north-4b"},
+        "metric_pointer": {
+          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-proxy-02",
+          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-proxy-02",
+          "suggested_metrics": ["proxy_connection_count", "proxy_throughput_MBps", "proxy_latency_ms"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-abcdef005", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef005",
+              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef005",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-sfs-proxy02-sys", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-proxy02-sys",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "sfs-meta-01",
+        "instance_name": "SFS元数据节点-01",
+        "instance_type": "SFS_METADATA",
+        "status": "RUNNING",
+        "role": "MASTER",
+        "host_info": {"ecs_instance_id": "i-abcdef006", "private_ip": "192.168.1.121", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-meta-01",
+          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-meta-01",
+          "suggested_metrics": ["metadata_ops_rate", "metadata_latency_ms", "open_file_count"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-abcdef006", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef006",
+              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef006",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-sfs-meta01-sys", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-meta01-sys",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              },
+              {
+                "instance_id": "vol-sfs-meta01-data", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-meta01-data",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "sfs-meta-02",
+        "instance_name": "SFS元数据节点-02",
+        "instance_type": "SFS_METADATA",
+        "status": "RUNNING",
+        "role": "SLAVE",
+        "host_info": {"ecs_instance_id": "i-abcdef007", "private_ip": "192.168.1.122", "az": "cn-north-4b"},
+        "metric_pointer": {
+          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-meta-02",
+          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-meta-02",
+          "suggested_metrics": ["metadata_ops_rate", "metadata_latency_ms", "open_file_count"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-abcdef007", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef007",
+              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef007",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-sfs-meta02-sys", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-meta02-sys",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              },
+              {
+                "instance_id": "vol-sfs-meta02-data", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-meta02-data",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "downstream_dependencies": [
+      {
+        "service_id": "obs-bucket-train-data",
+        "service_name": "OBS 训练数据桶",
+        "service_type": "OBS",
+        "dependency_type": "STRONG",
+        "protocol": "HTTP",
+        "status": "DEGRADED",
+        "health": {
+          "latency_p99_ms": 850,
+          "latency_baseline_ms": 50,
+          "error_rate": 0.12,
+          "request_rate_per_sec": 1200
+        },
+        "metric_pointer": {
+          "namespace": "SYS.OBS", "dimension_name": "bucket_name", "dimension_value": "obs-bucket-train-data",
+          "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-api",
+          "suggested_metrics": ["request_count", "first_byte_latency", "error_4xx_rate", "error_5xx_rate", "get_latency_p99", "put_latency_p99"]
+        },
+        "description": "SFS 数据持久化层，窗口内 P99 时延 850ms（基线 50ms）"
+      },
+      {
+        "service_id": "evs-sfs-meta",
+        "service_name": "EVS 元数据盘",
+        "service_type": "EVS",
+        "dependency_type": "STRONG",
+        "protocol": "TCP",
+        "status": "NORMAL",
+        "health": {
+          "latency_p99_ms": 2,
+          "latency_baseline_ms": 1,
+          "error_rate": 0.0,
+          "request_rate_per_sec": 800
+        },
+        "metric_pointer": {
+          "namespace": "SYS.EVS", "dimension_name": "service_id", "dimension_value": "evs-sfs-meta",
+          "log_group_id": "lg-evs-001", "log_stream_id": "ls-evs-meta",
+          "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+        },
+        "description": "元数据存储，窗口内状态正常"
+      },
+      {
+        "service_id": "vpc-subnet-001",
+        "service_name": "VPC 子网",
+        "service_type": "VPC",
+        "dependency_type": "STRONG",
+        "protocol": "TCP",
+        "status": "NORMAL",
+        "health": {
+          "latency_p99_ms": 0.5,
+          "latency_baseline_ms": 0.3,
+          "error_rate": 0.0,
+          "request_rate_per_sec": 50000
+        },
+        "metric_pointer": {
+          "namespace": "SYS.VPC", "dimension_name": "subnet_id", "dimension_value": "vpc-subnet-001",
+          "suggested_metrics": ["network_incoming_bytes_rate", "network_outgoing_bytes_rate", "network_dropped_packets"]
+        },
+        "description": "网络层，窗口内状态正常"
+      }
+    ],
+    "upstream_dependents": [
+      {
+        "service_id": "ecs-gpu-training-cluster",
+        "service_name": "GPU 训练集群",
+        "service_type": "ECS",
+        "dependency_type": "STRONG",
+        "protocol": "NFS",
+        "status": "DEGRADED",
+        "health": {
+          "latency_p99_ms": 325,
+          "latency_baseline_ms": 10,
+          "error_rate": 0.05,
+          "request_rate_per_sec": 3000
+        },
+        "metric_pointer": {
+          "namespace": "SYS.ECS", "dimension_name": "cluster_id", "dimension_value": "ecs-gpu-training-cluster",
+          "log_group_id": "lg-ecs-gpu-001", "log_stream_id": "ls-ecs-gpu-all",
+          "suggested_metrics": ["cpu_util", "gpu_util", "mem_util", "nfs_read_latency_ms"]
+        },
+        "description": "GPU 训练集群挂载 SFS，窗口内 NFS 读时延劣化"
+      }
+    ]
+  }
 }
 ```
 
@@ -240,48 +538,229 @@
 **Mock 返回：**
 ```json
 {
-  "service_id": "obs-bucket-train-data",
-  "service_name": "OBS 训练数据桶",
-  "service_type": "OBS",
-  "region": "cn-north-4",
-  "az": "cn-north-4a",
-  "status": "DEGRADED",
-  "topology_snapshot_time": "2025-03-05T10:30:00Z",
-  "time_range": {"start": "2025-03-05T08:00:00Z", "end": "2025-03-05T11:00:00Z"},
-  "instances": [
-    {"instance_id": "obs-gw-01", "instance_name": "OBS网关-01", "instance_type": "OBS_GATEWAY", "status": "RUNNING", "role": "GATEWAY", "host_info": {"ecs_instance_id": "i-obs001", "private_ip": "192.168.2.101", "az": "cn-north-4a"}},
-    {"instance_id": "obs-gw-02", "instance_name": "OBS网关-02", "instance_type": "OBS_GATEWAY", "status": "RUNNING", "role": "GATEWAY", "host_info": {"ecs_instance_id": "i-obs002", "private_ip": "192.168.2.102", "az": "cn-north-4b"}},
-    {"instance_id": "obs-store-01", "instance_name": "OBS存储节点-01", "instance_type": "OBS_STORAGE", "status": "RUNNING", "role": "MASTER", "host_info": {"ecs_instance_id": "i-obs003", "private_ip": "192.168.2.111", "az": "cn-north-4a"}},
-    {"instance_id": "obs-store-02", "instance_name": "OBS存储节点-02", "instance_type": "OBS_STORAGE", "status": "RUNNING", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-obs004", "private_ip": "192.168.2.112", "az": "cn-north-4a"}},
-    {"instance_id": "obs-store-03", "instance_name": "OBS存储节点-03", "instance_type": "OBS_STORAGE", "status": "DEGRADED", "role": "SLAVE", "host_info": {"ecs_instance_id": "i-obs005", "private_ip": "192.168.2.113", "az": "cn-north-4a"}}
-  ],
-  "downstream_dependencies": [
-    {
-      "service_id": "evs-obs-data",
-      "service_name": "EVS OBS数据盘",
-      "service_type": "EVS",
-      "dependency_type": "STRONG",
-      "protocol": "TCP",
-      "status": "NORMAL",
-      "latency_p99_ms": 1.5,
-      "latency_baseline_ms": 1.0,
-      "error_rate": 0.0,
-      "description": "OBS 底层块存储，窗口内正常"
+  "queried_instance_id": null,
+  "topology": {
+    "service_id": "obs-bucket-train-data",
+    "service_name": "OBS 训练数据桶",
+    "service_type": "OBS",
+    "region": "cn-north-4",
+    "az": "cn-north-4a",
+    "status": "DEGRADED",
+    "topology_snapshot_time": "2025-03-05T10:30:00Z",
+    "time_range": {"start": "2025-03-05T08:00:00Z", "end": "2025-03-05T11:00:00Z"},
+    "metric_pointer": {
+      "namespace": "SYS.OBS",
+      "dimension_name": "bucket_name",
+      "dimension_value": "obs-bucket-train-data",
+      "log_group_id": "lg-obs-001",
+      "log_stream_id": "ls-obs-all",
+      "suggested_metrics": ["request_count", "first_byte_latency", "get_latency_p99", "put_latency_p99", "error_4xx_rate", "error_5xx_rate"]
     },
-    {
-      "service_id": "vpc-subnet-002",
-      "service_name": "VPC 子网(OBS)",
-      "service_type": "VPC",
-      "dependency_type": "STRONG",
-      "protocol": "TCP",
-      "status": "NORMAL",
-      "latency_p99_ms": 0.4,
-      "latency_baseline_ms": 0.3,
-      "error_rate": 0.0,
-      "description": "网络层，窗口内正常"
-    }
-  ],
-  "upstream_dependents": []
+    "instances": [
+      {
+        "instance_id": "obs-gw-01",
+        "instance_name": "OBS网关-01",
+        "instance_type": "OBS_GATEWAY",
+        "status": "RUNNING",
+        "role": "GATEWAY",
+        "host_info": {"ecs_instance_id": "i-obs001", "private_ip": "192.168.2.101", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.OBS", "dimension_name": "instance_id", "dimension_value": "obs-gw-01",
+          "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-gw-01",
+          "suggested_metrics": ["gateway_request_count", "gateway_latency_p99", "gateway_error_rate"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-obs001", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs001",
+              "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs001",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-obs-gw01-sys", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-gw01-sys",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "obs-gw-02",
+        "instance_name": "OBS网关-02",
+        "instance_type": "OBS_GATEWAY",
+        "status": "RUNNING",
+        "role": "GATEWAY",
+        "host_info": {"ecs_instance_id": "i-obs002", "private_ip": "192.168.2.102", "az": "cn-north-4b"},
+        "metric_pointer": {
+          "namespace": "SYS.OBS", "dimension_name": "instance_id", "dimension_value": "obs-gw-02",
+          "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-gw-02",
+          "suggested_metrics": ["gateway_request_count", "gateway_latency_p99", "gateway_error_rate"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-obs002", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs002",
+              "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs002",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-obs-gw02-sys", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-gw02-sys",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "obs-store-01",
+        "instance_name": "OBS存储节点-01",
+        "instance_type": "OBS_STORAGE",
+        "status": "RUNNING",
+        "role": "MASTER",
+        "host_info": {"ecs_instance_id": "i-obs003", "private_ip": "192.168.2.111", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.OBS", "dimension_name": "instance_id", "dimension_value": "obs-store-01",
+          "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-store-01",
+          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "object_count", "storage_util"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-obs003", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs003",
+              "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs003",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-obs-store01-data", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-store01-data",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "obs-store-02",
+        "instance_name": "OBS存储节点-02",
+        "instance_type": "OBS_STORAGE",
+        "status": "RUNNING",
+        "role": "SLAVE",
+        "host_info": {"ecs_instance_id": "i-obs004", "private_ip": "192.168.2.112", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.OBS", "dimension_name": "instance_id", "dimension_value": "obs-store-02",
+          "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-store-02",
+          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "object_count", "storage_util"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-obs004", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs004",
+              "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs004",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-obs-store02-data", "instance_type": "EVS", "status": "RUNNING",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-store02-data",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "instance_id": "obs-store-03",
+        "instance_name": "OBS存储节点-03",
+        "instance_type": "OBS_STORAGE",
+        "status": "DEGRADED",
+        "role": "SLAVE",
+        "host_info": {"ecs_instance_id": "i-obs005", "private_ip": "192.168.2.113", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.OBS", "dimension_name": "instance_id", "dimension_value": "obs-store-03",
+          "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-store-03",
+          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "object_count", "storage_util"]
+        },
+        "underlying_instances": [
+          {
+            "instance_id": "i-obs005", "instance_type": "ECS", "status": "RUNNING",
+            "metric_pointer": {
+              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs005",
+              "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs005",
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+            },
+            "underlying_instances": [
+              {
+                "instance_id": "vol-obs-store03-data", "instance_type": "EVS", "status": "DEGRADED",
+                "metric_pointer": {
+                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-store03-data",
+                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "downstream_dependencies": [
+      {
+        "service_id": "evs-obs-data",
+        "service_name": "EVS OBS数据盘",
+        "service_type": "EVS",
+        "dependency_type": "STRONG",
+        "protocol": "TCP",
+        "status": "NORMAL",
+        "health": {
+          "latency_p99_ms": 1.5,
+          "latency_baseline_ms": 1.0,
+          "error_rate": 0.0,
+          "request_rate_per_sec": 5000
+        },
+        "metric_pointer": {
+          "namespace": "SYS.EVS", "dimension_name": "service_id", "dimension_value": "evs-obs-data",
+          "log_group_id": "lg-evs-obs-001", "log_stream_id": "ls-evs-obs-data",
+          "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+        },
+        "description": "OBS 底层块存储，窗口内正常"
+      },
+      {
+        "service_id": "vpc-subnet-002",
+        "service_name": "VPC 子网(OBS)",
+        "service_type": "VPC",
+        "dependency_type": "STRONG",
+        "protocol": "TCP",
+        "status": "NORMAL",
+        "health": {
+          "latency_p99_ms": 0.4,
+          "latency_baseline_ms": 0.3,
+          "error_rate": 0.0,
+          "request_rate_per_sec": 40000
+        },
+        "metric_pointer": {
+          "namespace": "SYS.VPC", "dimension_name": "subnet_id", "dimension_value": "vpc-subnet-002",
+          "suggested_metrics": ["network_incoming_bytes_rate", "network_outgoing_bytes_rate", "network_dropped_packets"]
+        },
+        "description": "网络层，窗口内正常"
+      }
+    ],
+    "upstream_dependents": []
+  }
 }
 ```
 
