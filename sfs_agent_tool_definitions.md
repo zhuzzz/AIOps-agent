@@ -1,32 +1,32 @@
-# SFS Turbo 智能故障诊断 — Tool Definitions & Mock Data
+# EFS Turbo 智能故障诊断 — Tool Definitions & Mock Data
 
 ## 1. 场景与流程
 
-**故障场景**：训练任务劣化 → SFS 告警触发 → Agent 自动定位根因为 OBS 慢盘导致性能劣化
+**故障场景**：训练任务劣化 → EFS 告警触发 → Agent 自动定位根因为 OBS 慢盘导致性能劣化
 
 **设计原则**：所有 Tool 均携带 `time_range_start` / `time_range_end` 时间窗参数，确保 Agent 在故障诊断全流程中始终聚焦于同一故障时段，避免拿到非故障时段的脏数据。
 
 **Agent 诊断流程**：
 
 ```
-收到 SFS 告警 (含 SFS instanceID, 时间戳)
+收到 EFS 告警 (含 EFS instanceID, 时间戳)
   │
   │  ← Agent 根据告警时间确定诊断时间窗: [告警首次触发前30min, 当前时间]
   │
-  ├─ [get_service_topology]          通过 instance_id 反查所属服务，获取拓扑快照 + 实例纵向依赖链(SFS→ECS→EVS) + metric_pointer (一次拿全)
+  ├─ [get_service_topology]          通过 instance_id 反查所属服务，获取拓扑快照 + EFS cluster(含可选OBS后端) + 实例关联链(EFS↔ECS→EVS) + metric_pointer (一次拿全)
   │
   │  ← 拿到包含时间窗的拓扑图后，并行拉取本服务的全部告警、指标异常、日志
-  ├─┬─ [query_alarms]                并行: 拉取时间窗内 SFS 全量告警 (12条)
-  │ ├─ [detect_metric_anomalies]     并行: 对 SFS 全部实例做指标异常检测
-  │ └─ [query_logs]                  并行: 拉取时间窗内 SFS 关键日志
+  ├─┬─ [query_alarms]                并行: 拉取时间窗内 EFS 全量告警 (12条)
+  │ ├─ [detect_metric_anomalies]     并行: 对 EFS 全部实例做指标异常检测
+  │ └─ [query_logs]                  并行: 拉取时间窗内 EFS 关键日志
   │
   ├─ [cluster_alarms]                告警聚类 → 4 大类（限定时间窗）
   │
   ├─ [create_diagnosis_task] × 4     对每类下发诊断（传入时间窗）
-  ├─ [get_diagnosis_result] × 4      轮询结果 → 全部未找到 SFS 自身根因
+  ├─ [get_diagnosis_result] × 4      轮询结果 → 全部未找到 EFS 自身根因
   │
-  │  ← topology 已返回依赖健康度，Agent 发现 OBS status=DEGRADED, latency_p99=850ms
-  │——根据已有的拓扑快照，诊断 OBS 服务
+  │  ← topology.efs_cluster.obs_backend 已返回 OBS 健康度，Agent 发现 OBS status=DEGRADED, latency_p99=850ms
+  │——根据已有的拓扑快照中 cluster 的 obs_backend，诊断 OBS 服务
   ├─┬─ [query_alarms]                并行: 拉取时间窗内 OBS 全量告警 (8条)
   │ ├─ [detect_metric_anomalies]     并行: 对 OBS 全部实例做指标异常检测
   │ └─ [query_logs]                  并行: 拉取时间窗内 OBS 关键日志
@@ -72,7 +72,7 @@
 
 | # | Tool Name | 用途 |
 |---|-----------|------|
-| 1 | get_service_topology | 通过 service_id 或 instance_id 获取服务拓扑、实例纵向依赖链（SFS→ECS→EVS）、metric_pointer 及运行时健康度 |
+| 1 | get_service_topology | 通过 service_id 或 instance_id 获取服务拓扑、EFS cluster（含可选 OBS 后端）、实例关联链（EFS↔ECS→EVS）、metric_pointer 及运行时健康度 |
 | 2 | query_alarms | 按条件查询告警列表 |
 | 3 | get_alarm_detail | 获取单条告警详情 |
 | 4 | cluster_alarms | 告警聚类分析 |
@@ -95,17 +95,17 @@
   "type": "function",
   "function": {
     "name": "get_service_topology",
-    "description": "获取指定时间窗内的服务拓扑快照。支持两种入口：1) 通过 service_id 查询已知服务；2) 通过 instance_id（如告警中的 SFS instanceID）自动反查所属服务并返回完整拓扑，response 中 queried_instance_id 标记告警实例。两个 ID 至少提供一个，均提供时以 service_id 为主、instance_id 用于定位。\n\n返回内容包含：服务元信息、实例列表（每个实例携带纵向依赖链 underlying_instances: SFS instance → ECS instance → EVS instance）、上下游服务依赖（含运行时健康指标）。每个实体（服务、实例、依赖）均携带 metric_pointer（含 namespace、dimension、log_group_id、log_stream_id、suggested_metrics），Agent 可直接用于后续 query_metrics / query_logs 调用，无需额外查询指标命名空间或日志流 ID。\n\n实例的 underlying_instances 字段描述纵向承载关系：一个 SFS 实例运行在哪个 ECS 实例上，该 ECS 又挂载了哪些 EVS 磁盘，每层均有独立 metric_pointer，支持按层下钻诊断（如 SFS 层面指标正常时，可直接下钻到 ECS cpu_util / EVS disk_io_await）。\n\n当本服务诊断未找到根因时，Agent 应从 downstream_dependencies 中选择 status=DEGRADED 且 dependency_type=STRONG 的服务继续追溯。",
+    "description": "获取指定时间窗内的服务拓扑快照。支持两种入口：1) 通过 service_id 查询已知服务；2) 通过 instance_id（如告警中的 EFS instanceID）自动反查所属服务并返回完整拓扑，response 中 queried_instance_id 标记告警实例。两个 ID 至少提供一个，均提供时以 service_id 为主、instance_id 用于定位。\n\n返回内容包含：服务元信息、EFS cluster（含可选的 OBS 后端桶）、实例列表（每个 EFS 实例携带 associated_ecs 关联的 ECS 实例，ECS 下挂 attached_evs 磁盘列表）、上下游服务依赖（含运行时健康指标）。每个实体（服务、实例、ECS、EVS、OBS）均携带 metric_pointer（含 namespace、dimension、log_group_id、log_stream_id、suggested_metrics），Agent 可直接用于后续 query_metrics / query_logs 调用，无需额外查询。\n\n拓扑关联模型：\n- EFS instance ↔ ECS instance：平级双向关联（associated_ecs），ECS 指标包含 cpu、内存、网络、系统盘容量\n- ECS instance → EVS instance：ECS 下挂的 EVS 磁盘（attached_evs），EVS 指标为 iostat 类（带宽、时延、IO大小）\n- EFS instance → EFS cluster_id：所属集群\n- EFS cluster → OBS bucket_id：可选，仅用户配置了 OBS 后端时才有，OBS 指标包含 bps/tps、接口时延\n\n当本服务诊断未找到根因时，Agent 应检查 associated_ecs/attached_evs 的纵向链路，以及 cluster 下的 obs_backend（若存在且 status=DEGRADED），再从 downstream_dependencies 中选择 status=DEGRADED 且 dependency_type=STRONG 的服务继续追溯。",
     "parameters": {
       "type": "object",
       "properties": {
         "service_id": {
           "type": "string",
-          "description": "服务唯一标识，如 'sfs-turbo-001'。与 instance_id 至少提供一个"
+          "description": "服务唯一标识，如 'efs-turbo-001'。与 instance_id 至少提供一个"
         },
         "instance_id": {
           "type": "string",
-          "description": "实例唯一标识，如 'sfs-node-02'（告警中携带的 SFS instanceID）。提供时自动反查所属服务并返回完整拓扑，response 中 queried_instance_id 标记该实例。与 service_id 至少提供一个"
+          "description": "实例唯一标识，如 'efs-node-02'（告警中携带的 EFS instanceID）。提供时自动反查所属服务并返回完整拓扑，response 中 queried_instance_id 标记该实例。与 service_id 至少提供一个"
         },
         "time_range_start": {
           "type": "string",
@@ -128,7 +128,7 @@
         },
         "include_instances": {
           "type": "boolean",
-          "description": "是否包含实例详情列表（含 host_info、underlying_instances、metric_pointer）",
+          "description": "是否包含实例详情列表（含 host_info、associated_ecs、metric_pointer）",
           "default": true
         }
       },
@@ -138,12 +138,12 @@
 }
 ```
 
-#### Mock 调用 A — 通过告警中的 SFS instanceID 查询拓扑（direction=BOTH）
+#### Mock 调用 A — 通过告警中的 EFS instanceID 查询拓扑（direction=BOTH）
 
 **Agent 调用参数：**
 ```json
 {
-  "instance_id": "sfs-node-02",
+  "instance_id": "efs-node-02",
   "time_range_start": "2025-03-05T09:00:00Z",
   "time_range_end": "2025-03-05T11:00:00Z",
   "direction": "BOTH",
@@ -155,326 +155,300 @@
 **Mock 返回：**
 ```json
 {
-  "queried_instance_id": "sfs-node-02",
+  "queried_instance_id": "efs-node-02",
   "topology": {
-    "service_id": "sfs-turbo-001",
-    "service_name": "SFS Turbo 文件存储",
-    "service_type": "SFS_TURBO",
+    "service_id": "efs-turbo-001",
+    "service_name": "EFS Turbo 弹性文件存储",
+    "service_type": "EFS_TURBO",
     "region": "cn-north-4",
     "az": "cn-north-4a",
     "status": "DEGRADED",
     "topology_snapshot_time": "2025-03-05T10:30:00Z",
     "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
     "metric_pointer": {
-      "namespace": "SYS.SFS",
+      "namespace": "SYS.EFS",
       "dimension_name": "service_id",
-      "dimension_value": "sfs-turbo-001",
-      "log_group_id": "lg-sfs-001",
-      "log_stream_id": "ls-sfs-all",
+      "dimension_value": "efs-turbo-001",
+      "log_group_id": "lg-efs-001",
+      "log_stream_id": "ls-efs-all",
       "suggested_metrics": ["nfs_read_ops", "nfs_write_ops", "nfs_read_latency_p99", "nfs_write_latency_p99", "throughput_read_MBps", "throughput_write_MBps"]
     },
-    "instances": [
-      {
-        "instance_id": "sfs-node-01",
-        "instance_name": "SFS存储节点-01",
-        "instance_type": "SFS_STORAGE",
-        "status": "RUNNING",
-        "role": "MASTER",
-        "host_info": {"ecs_instance_id": "i-abcdef001", "private_ip": "192.168.1.101", "az": "cn-north-4a"},
-        "metric_pointer": {
-          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-node-01",
-          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-node-01",
-          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "nfs_op_latency_ms", "connection_count"]
-        },
-        "underlying_instances": [
-          {
-            "instance_id": "i-abcdef001", "instance_type": "ECS", "status": "RUNNING",
-            "metric_pointer": {
-              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef001",
-              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef001",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
-            },
-            "underlying_instances": [
-              {
-                "instance_id": "vol-sfs-node01-sys", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node01-sys",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              },
-              {
-                "instance_id": "vol-sfs-node01-data", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node01-data",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              }
-            ]
-          }
-        ]
+    "efs_cluster": {
+      "cluster_id": "efs-cluster-001",
+      "cluster_name": "EFS Turbo 集群-01",
+      "status": "DEGRADED",
+      "metric_pointer": {
+        "namespace": "SYS.EFS", "dimension_name": "cluster_id", "dimension_value": "efs-cluster-001",
+        "log_group_id": "lg-efs-001", "log_stream_id": "ls-efs-cluster-001",
+        "suggested_metrics": ["cluster_iops", "cluster_throughput_MBps", "cluster_latency_p99_ms"]
       },
-      {
-        "instance_id": "sfs-node-02",
-        "instance_name": "SFS存储节点-02",
-        "instance_type": "SFS_STORAGE",
-        "status": "DEGRADED",
-        "role": "SLAVE",
-        "host_info": {"ecs_instance_id": "i-abcdef002", "private_ip": "192.168.1.102", "az": "cn-north-4a"},
-        "metric_pointer": {
-          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-node-02",
-          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-node-02",
-          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "nfs_op_latency_ms", "connection_count"]
-        },
-        "underlying_instances": [
-          {
-            "instance_id": "i-abcdef002", "instance_type": "ECS", "status": "RUNNING",
-            "metric_pointer": {
-              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef002",
-              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef002",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
-            },
-            "underlying_instances": [
-              {
-                "instance_id": "vol-sfs-node02-sys", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node02-sys",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              },
-              {
-                "instance_id": "vol-sfs-node02-data", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node02-data",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              }
-            ]
-          }
-        ]
-      },
-      {
-        "instance_id": "sfs-node-03",
-        "instance_name": "SFS存储节点-03",
-        "instance_type": "SFS_STORAGE",
-        "status": "RUNNING",
-        "role": "SLAVE",
-        "host_info": {"ecs_instance_id": "i-abcdef003", "private_ip": "192.168.1.103", "az": "cn-north-4b"},
-        "metric_pointer": {
-          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-node-03",
-          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-node-03",
-          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "nfs_op_latency_ms", "connection_count"]
-        },
-        "underlying_instances": [
-          {
-            "instance_id": "i-abcdef003", "instance_type": "ECS", "status": "RUNNING",
-            "metric_pointer": {
-              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef003",
-              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef003",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
-            },
-            "underlying_instances": [
-              {
-                "instance_id": "vol-sfs-node03-sys", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node03-sys",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              },
-              {
-                "instance_id": "vol-sfs-node03-data", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-node03-data",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              }
-            ]
-          }
-        ]
-      },
-      {
-        "instance_id": "sfs-proxy-01",
-        "instance_name": "SFS协议代理-01",
-        "instance_type": "SFS_PROXY",
-        "status": "RUNNING",
-        "role": "PROXY",
-        "host_info": {"ecs_instance_id": "i-abcdef004", "private_ip": "192.168.1.111", "az": "cn-north-4a"},
-        "metric_pointer": {
-          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-proxy-01",
-          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-proxy-01",
-          "suggested_metrics": ["proxy_connection_count", "proxy_throughput_MBps", "proxy_latency_ms"]
-        },
-        "underlying_instances": [
-          {
-            "instance_id": "i-abcdef004", "instance_type": "ECS", "status": "RUNNING",
-            "metric_pointer": {
-              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef004",
-              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef004",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
-            },
-            "underlying_instances": [
-              {
-                "instance_id": "vol-sfs-proxy01-sys", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-proxy01-sys",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              }
-            ]
-          }
-        ]
-      },
-      {
-        "instance_id": "sfs-proxy-02",
-        "instance_name": "SFS协议代理-02",
-        "instance_type": "SFS_PROXY",
-        "status": "RUNNING",
-        "role": "PROXY",
-        "host_info": {"ecs_instance_id": "i-abcdef005", "private_ip": "192.168.1.112", "az": "cn-north-4b"},
-        "metric_pointer": {
-          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-proxy-02",
-          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-proxy-02",
-          "suggested_metrics": ["proxy_connection_count", "proxy_throughput_MBps", "proxy_latency_ms"]
-        },
-        "underlying_instances": [
-          {
-            "instance_id": "i-abcdef005", "instance_type": "ECS", "status": "RUNNING",
-            "metric_pointer": {
-              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef005",
-              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef005",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
-            },
-            "underlying_instances": [
-              {
-                "instance_id": "vol-sfs-proxy02-sys", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-proxy02-sys",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              }
-            ]
-          }
-        ]
-      },
-      {
-        "instance_id": "sfs-meta-01",
-        "instance_name": "SFS元数据节点-01",
-        "instance_type": "SFS_METADATA",
-        "status": "RUNNING",
-        "role": "MASTER",
-        "host_info": {"ecs_instance_id": "i-abcdef006", "private_ip": "192.168.1.121", "az": "cn-north-4a"},
-        "metric_pointer": {
-          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-meta-01",
-          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-meta-01",
-          "suggested_metrics": ["metadata_ops_rate", "metadata_latency_ms", "open_file_count"]
-        },
-        "underlying_instances": [
-          {
-            "instance_id": "i-abcdef006", "instance_type": "ECS", "status": "RUNNING",
-            "metric_pointer": {
-              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef006",
-              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef006",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
-            },
-            "underlying_instances": [
-              {
-                "instance_id": "vol-sfs-meta01-sys", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-meta01-sys",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              },
-              {
-                "instance_id": "vol-sfs-meta01-data", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-meta01-data",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              }
-            ]
-          }
-        ]
-      },
-      {
-        "instance_id": "sfs-meta-02",
-        "instance_name": "SFS元数据节点-02",
-        "instance_type": "SFS_METADATA",
-        "status": "RUNNING",
-        "role": "SLAVE",
-        "host_info": {"ecs_instance_id": "i-abcdef007", "private_ip": "192.168.1.122", "az": "cn-north-4b"},
-        "metric_pointer": {
-          "namespace": "SYS.SFS", "dimension_name": "instance_id", "dimension_value": "sfs-meta-02",
-          "log_group_id": "lg-sfs-001", "log_stream_id": "ls-sfs-meta-02",
-          "suggested_metrics": ["metadata_ops_rate", "metadata_latency_ms", "open_file_count"]
-        },
-        "underlying_instances": [
-          {
-            "instance_id": "i-abcdef007", "instance_type": "ECS", "status": "RUNNING",
-            "metric_pointer": {
-              "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef007",
-              "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef007",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
-            },
-            "underlying_instances": [
-              {
-                "instance_id": "vol-sfs-meta02-sys", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-meta02-sys",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              },
-              {
-                "instance_id": "vol-sfs-meta02-data", "instance_type": "EVS", "status": "RUNNING",
-                "metric_pointer": {
-                  "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-sfs-meta02-data",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
-                }
-              }
-            ]
-          }
-        ]
-      }
-    ],
-    "downstream_dependencies": [
-      {
-        "service_id": "obs-bucket-train-data",
-        "service_name": "OBS 训练数据桶",
-        "service_type": "OBS",
-        "dependency_type": "STRONG",
-        "protocol": "HTTP",
+      "obs_backend": {
+        "bucket_id": "obs-bucket-train-data",
+        "bucket_name": "OBS 训练数据桶",
         "status": "DEGRADED",
         "health": {
           "latency_p99_ms": 850,
           "latency_baseline_ms": 50,
           "error_rate": 0.12,
-          "request_rate_per_sec": 1200
+          "bps": 524288000,
+          "tps": 1200
         },
         "metric_pointer": {
           "namespace": "SYS.OBS", "dimension_name": "bucket_name", "dimension_value": "obs-bucket-train-data",
           "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-api",
-          "suggested_metrics": ["request_count", "first_byte_latency", "error_4xx_rate", "error_5xx_rate", "get_latency_p99", "put_latency_p99"]
+          "suggested_metrics": ["download_bytes_per_sec", "upload_bytes_per_sec", "request_count_per_sec", "first_byte_latency", "get_latency_p99", "put_latency_p99", "error_4xx_rate", "error_5xx_rate"]
         },
-        "description": "SFS 数据持久化层，窗口内 P99 时延 850ms（基线 50ms）"
+        "description": "EFS 数据持久化后端 OBS 桶，窗口内 P99 时延 850ms（基线 50ms）"
+      }
+    },
+    "instances": [
+      {
+        "instance_id": "efs-node-01",
+        "instance_name": "EFS存储节点-01",
+        "instance_type": "EFS_STORAGE",
+        "status": "RUNNING",
+        "role": "MASTER",
+        "host_info": {"private_ip": "192.168.1.101", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.EFS", "dimension_name": "instance_id", "dimension_value": "efs-node-01",
+          "log_group_id": "lg-efs-001", "log_stream_id": "ls-efs-node-01",
+          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "nfs_op_latency_ms", "connection_count"]
+        },
+        "associated_ecs": {
+          "instance_id": "i-abcdef001", "status": "RUNNING",
+          "metric_pointer": {
+            "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef001",
+            "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef001",
+            "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
+          },
+          "attached_evs": [
+            {
+              "instance_id": "vol-efs-node01-sys", "disk_type": "SYS", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-node01-sys",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            },
+            {
+              "instance_id": "vol-efs-node01-data", "disk_type": "DATA", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-node01-data",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            }
+          ]
+        }
       },
       {
-        "service_id": "evs-sfs-meta",
-        "service_name": "EVS 元数据盘",
-        "service_type": "EVS",
-        "dependency_type": "STRONG",
-        "protocol": "TCP",
-        "status": "NORMAL",
-        "health": {
-          "latency_p99_ms": 2,
-          "latency_baseline_ms": 1,
-          "error_rate": 0.0,
-          "request_rate_per_sec": 800
-        },
+        "instance_id": "efs-node-02",
+        "instance_name": "EFS存储节点-02",
+        "instance_type": "EFS_STORAGE",
+        "status": "DEGRADED",
+        "role": "SLAVE",
+        "host_info": {"private_ip": "192.168.1.102", "az": "cn-north-4a"},
         "metric_pointer": {
-          "namespace": "SYS.EVS", "dimension_name": "service_id", "dimension_value": "evs-sfs-meta",
-          "log_group_id": "lg-evs-001", "log_stream_id": "ls-evs-meta",
-          "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+          "namespace": "SYS.EFS", "dimension_name": "instance_id", "dimension_value": "efs-node-02",
+          "log_group_id": "lg-efs-001", "log_stream_id": "ls-efs-node-02",
+          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "nfs_op_latency_ms", "connection_count"]
         },
-        "description": "元数据存储，窗口内状态正常"
+        "associated_ecs": {
+          "instance_id": "i-abcdef002", "status": "RUNNING",
+          "metric_pointer": {
+            "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef002",
+            "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef002",
+            "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
+          },
+          "attached_evs": [
+            {
+              "instance_id": "vol-efs-node02-sys", "disk_type": "SYS", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-node02-sys",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            },
+            {
+              "instance_id": "vol-efs-node02-data", "disk_type": "DATA", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-node02-data",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            }
+          ]
+        }
       },
+      {
+        "instance_id": "efs-node-03",
+        "instance_name": "EFS存储节点-03",
+        "instance_type": "EFS_STORAGE",
+        "status": "RUNNING",
+        "role": "SLAVE",
+        "host_info": {"private_ip": "192.168.1.103", "az": "cn-north-4b"},
+        "metric_pointer": {
+          "namespace": "SYS.EFS", "dimension_name": "instance_id", "dimension_value": "efs-node-03",
+          "log_group_id": "lg-efs-001", "log_stream_id": "ls-efs-node-03",
+          "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "nfs_op_latency_ms", "connection_count"]
+        },
+        "associated_ecs": {
+          "instance_id": "i-abcdef003", "status": "RUNNING",
+          "metric_pointer": {
+            "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef003",
+            "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef003",
+            "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
+          },
+          "attached_evs": [
+            {
+              "instance_id": "vol-efs-node03-sys", "disk_type": "SYS", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-node03-sys",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            },
+            {
+              "instance_id": "vol-efs-node03-data", "disk_type": "DATA", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-node03-data",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            }
+          ]
+        }
+      },
+      {
+        "instance_id": "efs-proxy-01",
+        "instance_name": "EFS协议代理-01",
+        "instance_type": "EFS_PROXY",
+        "status": "RUNNING",
+        "role": "PROXY",
+        "host_info": {"private_ip": "192.168.1.111", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.EFS", "dimension_name": "instance_id", "dimension_value": "efs-proxy-01",
+          "log_group_id": "lg-efs-001", "log_stream_id": "ls-efs-proxy-01",
+          "suggested_metrics": ["proxy_connection_count", "proxy_throughput_MBps", "proxy_latency_ms"]
+        },
+        "associated_ecs": {
+          "instance_id": "i-abcdef004", "status": "RUNNING",
+          "metric_pointer": {
+            "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef004",
+            "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef004",
+            "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
+          },
+          "attached_evs": [
+            {
+              "instance_id": "vol-efs-proxy01-sys", "disk_type": "SYS", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-proxy01-sys",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            }
+          ]
+        }
+      },
+      {
+        "instance_id": "efs-proxy-02",
+        "instance_name": "EFS协议代理-02",
+        "instance_type": "EFS_PROXY",
+        "status": "RUNNING",
+        "role": "PROXY",
+        "host_info": {"private_ip": "192.168.1.112", "az": "cn-north-4b"},
+        "metric_pointer": {
+          "namespace": "SYS.EFS", "dimension_name": "instance_id", "dimension_value": "efs-proxy-02",
+          "log_group_id": "lg-efs-001", "log_stream_id": "ls-efs-proxy-02",
+          "suggested_metrics": ["proxy_connection_count", "proxy_throughput_MBps", "proxy_latency_ms"]
+        },
+        "associated_ecs": {
+          "instance_id": "i-abcdef005", "status": "RUNNING",
+          "metric_pointer": {
+            "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef005",
+            "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef005",
+            "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
+          },
+          "attached_evs": [
+            {
+              "instance_id": "vol-efs-proxy02-sys", "disk_type": "SYS", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-proxy02-sys",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            }
+          ]
+        }
+      },
+      {
+        "instance_id": "efs-meta-01",
+        "instance_name": "EFS元数据节点-01",
+        "instance_type": "EFS_METADATA",
+        "status": "RUNNING",
+        "role": "MASTER",
+        "host_info": {"private_ip": "192.168.1.121", "az": "cn-north-4a"},
+        "metric_pointer": {
+          "namespace": "SYS.EFS", "dimension_name": "instance_id", "dimension_value": "efs-meta-01",
+          "log_group_id": "lg-efs-001", "log_stream_id": "ls-efs-meta-01",
+          "suggested_metrics": ["metadata_ops_rate", "metadata_latency_ms", "open_file_count"]
+        },
+        "associated_ecs": {
+          "instance_id": "i-abcdef006", "status": "RUNNING",
+          "metric_pointer": {
+            "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef006",
+            "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef006",
+            "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
+          },
+          "attached_evs": [
+            {
+              "instance_id": "vol-efs-meta01-sys", "disk_type": "SYS", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-meta01-sys",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            },
+            {
+              "instance_id": "vol-efs-meta01-data", "disk_type": "DATA", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-meta01-data",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            }
+          ]
+        }
+      },
+      {
+        "instance_id": "efs-meta-02",
+        "instance_name": "EFS元数据节点-02",
+        "instance_type": "EFS_METADATA",
+        "status": "RUNNING",
+        "role": "SLAVE",
+        "host_info": {"private_ip": "192.168.1.122", "az": "cn-north-4b"},
+        "metric_pointer": {
+          "namespace": "SYS.EFS", "dimension_name": "instance_id", "dimension_value": "efs-meta-02",
+          "log_group_id": "lg-efs-001", "log_stream_id": "ls-efs-meta-02",
+          "suggested_metrics": ["metadata_ops_rate", "metadata_latency_ms", "open_file_count"]
+        },
+        "associated_ecs": {
+          "instance_id": "i-abcdef007", "status": "RUNNING",
+          "metric_pointer": {
+            "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-abcdef007",
+            "log_group_id": "lg-ecs-001", "log_stream_id": "ls-ecs-i-abcdef007",
+            "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
+          },
+          "attached_evs": [
+            {
+              "instance_id": "vol-efs-meta02-sys", "disk_type": "SYS", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-meta02-sys",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            },
+            {
+              "instance_id": "vol-efs-meta02-data", "disk_type": "DATA", "status": "RUNNING",
+              "metric_pointer": {
+                "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-efs-meta02-data",
+                "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "downstream_dependencies": [
       {
         "service_id": "vpc-subnet-001",
         "service_name": "VPC 子网",
@@ -514,13 +488,12 @@
           "log_group_id": "lg-ecs-gpu-001", "log_stream_id": "ls-ecs-gpu-all",
           "suggested_metrics": ["cpu_util", "gpu_util", "mem_util", "nfs_read_latency_ms"]
         },
-        "description": "GPU 训练集群挂载 SFS，窗口内 NFS 读时延劣化"
+        "description": "GPU 训练集群挂载 EFS，窗口内 NFS 读时延劣化"
       }
     ]
   }
 }
 ```
-
 #### Mock 调用 B — 追溯到 OBS 后查询 OBS 拓扑（direction=DOWNSTREAM）
 
 **Agent 调用参数：**
@@ -569,25 +542,23 @@
           "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-gw-01",
           "suggested_metrics": ["gateway_request_count", "gateway_latency_p99", "gateway_error_rate"]
         },
-        "underlying_instances": [
-          {
-            "instance_id": "i-obs001", "instance_type": "ECS", "status": "RUNNING",
+        "associated_ecs": {
+            "instance_id": "i-obs001", "status": "RUNNING",
             "metric_pointer": {
               "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs001",
               "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs001",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
             },
-            "underlying_instances": [
+            "attached_evs": [
               {
-                "instance_id": "vol-obs-gw01-sys", "instance_type": "EVS", "status": "RUNNING",
+                "instance_id": "vol-obs-gw01-sys", "status": "RUNNING",
                 "metric_pointer": {
                   "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-gw01-sys",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                  "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
                 }
               }
             ]
           }
-        ]
       },
       {
         "instance_id": "obs-gw-02",
@@ -601,25 +572,23 @@
           "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-gw-02",
           "suggested_metrics": ["gateway_request_count", "gateway_latency_p99", "gateway_error_rate"]
         },
-        "underlying_instances": [
-          {
-            "instance_id": "i-obs002", "instance_type": "ECS", "status": "RUNNING",
+        "associated_ecs": {
+            "instance_id": "i-obs002", "status": "RUNNING",
             "metric_pointer": {
               "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs002",
               "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs002",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
             },
-            "underlying_instances": [
+            "attached_evs": [
               {
-                "instance_id": "vol-obs-gw02-sys", "instance_type": "EVS", "status": "RUNNING",
+                "instance_id": "vol-obs-gw02-sys", "status": "RUNNING",
                 "metric_pointer": {
                   "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-gw02-sys",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                  "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
                 }
               }
             ]
           }
-        ]
       },
       {
         "instance_id": "obs-store-01",
@@ -633,25 +602,23 @@
           "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-store-01",
           "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "object_count", "storage_util"]
         },
-        "underlying_instances": [
-          {
-            "instance_id": "i-obs003", "instance_type": "ECS", "status": "RUNNING",
+        "associated_ecs": {
+            "instance_id": "i-obs003", "status": "RUNNING",
             "metric_pointer": {
               "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs003",
               "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs003",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
             },
-            "underlying_instances": [
+            "attached_evs": [
               {
-                "instance_id": "vol-obs-store01-data", "instance_type": "EVS", "status": "RUNNING",
+                "instance_id": "vol-obs-store01-data", "status": "RUNNING",
                 "metric_pointer": {
                   "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-store01-data",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                  "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
                 }
               }
             ]
           }
-        ]
       },
       {
         "instance_id": "obs-store-02",
@@ -665,25 +632,23 @@
           "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-store-02",
           "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "object_count", "storage_util"]
         },
-        "underlying_instances": [
-          {
-            "instance_id": "i-obs004", "instance_type": "ECS", "status": "RUNNING",
+        "associated_ecs": {
+            "instance_id": "i-obs004", "status": "RUNNING",
             "metric_pointer": {
               "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs004",
               "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs004",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
             },
-            "underlying_instances": [
+            "attached_evs": [
               {
-                "instance_id": "vol-obs-store02-data", "instance_type": "EVS", "status": "RUNNING",
+                "instance_id": "vol-obs-store02-data", "status": "RUNNING",
                 "metric_pointer": {
                   "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-store02-data",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                  "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
                 }
               }
             ]
           }
-        ]
       },
       {
         "instance_id": "obs-store-03",
@@ -697,25 +662,23 @@
           "log_group_id": "lg-obs-001", "log_stream_id": "ls-obs-store-03",
           "suggested_metrics": ["disk_read_bytes_rate", "disk_write_bytes_rate", "object_count", "storage_util"]
         },
-        "underlying_instances": [
-          {
-            "instance_id": "i-obs005", "instance_type": "ECS", "status": "RUNNING",
+        "associated_ecs": {
+            "instance_id": "i-obs005", "status": "RUNNING",
             "metric_pointer": {
               "namespace": "SYS.ECS", "dimension_name": "instance_id", "dimension_value": "i-obs005",
               "log_group_id": "lg-ecs-obs-001", "log_stream_id": "ls-ecs-i-obs005",
-              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate"]
+              "suggested_metrics": ["cpu_util", "mem_util", "network_incoming_bytes_rate", "network_outgoing_bytes_rate", "sys_disk_usage_percent"]
             },
-            "underlying_instances": [
+            "attached_evs": [
               {
-                "instance_id": "vol-obs-store03-data", "instance_type": "EVS", "status": "DEGRADED",
+                "instance_id": "vol-obs-store03-data", "status": "DEGRADED",
                 "metric_pointer": {
                   "namespace": "SYS.EVS", "dimension_name": "disk_name", "dimension_value": "vol-obs-store03-data",
-                  "suggested_metrics": ["disk_io_await", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_util"]
+                  "suggested_metrics": ["disk_io_await_ms", "disk_read_bytes_rate", "disk_write_bytes_rate", "disk_io_size_kb", "disk_iops", "disk_util"]
                 }
               }
             ]
           }
-        ]
       }
     ],
     "downstream_dependencies": [
@@ -818,12 +781,12 @@
 }
 ```
 
-#### Mock 调用 A — SFS 全量活跃告警
+#### Mock 调用 A — EFS 全量活跃告警
 
 **Agent 调用参数：**
 ```json
 {
-  "service_id": "sfs-turbo-001",
+  "service_id": "efs-turbo-001",
   "time_range_start": "2025-03-05T09:00:00Z",
   "time_range_end": "2025-03-05T11:00:00Z",
   "status": ["FIRING"]
@@ -836,18 +799,18 @@
   "total": 12,
   "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
   "alarms": [
-    {"alarm_id": "ALM-SFS-001", "alarm_name": "SFS NFS读时延超阈值", "alarm_level": "CRITICAL", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-01", "metric": "sfs_nfs_read_latency_ms", "current_value": 320.5, "threshold": 50.0, "unit": "ms", "first_occur_time": "2025-03-05T09:15:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 38, "description": "NFS 读操作 P99 时延 320.5ms，超过阈值 50ms", "tags": {"az": "cn-north-4a", "operation": "read", "protocol": "nfs"}},
-    {"alarm_id": "ALM-SFS-002", "alarm_name": "SFS NFS写时延超阈值", "alarm_level": "CRITICAL", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-01", "metric": "sfs_nfs_write_latency_ms", "current_value": 580.2, "threshold": 100.0, "unit": "ms", "first_occur_time": "2025-03-05T09:18:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 35, "description": "NFS 写操作 P99 时延 580.2ms", "tags": {"az": "cn-north-4a", "operation": "write", "protocol": "nfs"}},
-    {"alarm_id": "ALM-SFS-003", "alarm_name": "SFS NFS读时延超阈值", "alarm_level": "MAJOR", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-02", "metric": "sfs_nfs_read_latency_ms", "current_value": 280.3, "threshold": 50.0, "unit": "ms", "first_occur_time": "2025-03-05T09:20:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 30, "description": "NFS 读操作 P99 时延 280.3ms", "tags": {"az": "cn-north-4a", "operation": "read", "protocol": "nfs"}},
-    {"alarm_id": "ALM-SFS-004", "alarm_name": "SFS NFS写时延超阈值", "alarm_level": "MAJOR", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-02", "metric": "sfs_nfs_write_latency_ms", "current_value": 490.7, "threshold": 100.0, "unit": "ms", "first_occur_time": "2025-03-05T09:22:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 28, "description": "NFS 写操作 P99 时延 490.7ms", "tags": {"az": "cn-north-4a", "operation": "write", "protocol": "nfs"}},
-    {"alarm_id": "ALM-SFS-005", "alarm_name": "SFS 后端OBS请求超时率升高", "alarm_level": "CRITICAL", "alarm_source": "ANOMALY_DETECTION", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-01", "metric": "sfs_backend_obs_timeout_rate", "current_value": 0.15, "threshold": 0.01, "unit": "ratio", "first_occur_time": "2025-03-05T09:12:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 42, "description": "后端 OBS 请求超时率 15%", "tags": {"az": "cn-north-4a", "backend": "obs"}},
-    {"alarm_id": "ALM-SFS-006", "alarm_name": "SFS 后端OBS请求超时率升高", "alarm_level": "MAJOR", "alarm_source": "ANOMALY_DETECTION", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-02", "metric": "sfs_backend_obs_timeout_rate", "current_value": 0.12, "threshold": 0.01, "unit": "ratio", "first_occur_time": "2025-03-05T09:14:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 38, "description": "后端 OBS 请求超时率 12%", "tags": {"az": "cn-north-4a", "backend": "obs"}},
-    {"alarm_id": "ALM-SFS-007", "alarm_name": "SFS IO队列深度过高", "alarm_level": "MAJOR", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-01", "metric": "sfs_io_queue_depth", "current_value": 512, "threshold": 128, "unit": "count", "first_occur_time": "2025-03-05T09:25:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 25, "description": "IO 队列深度 512", "tags": {"az": "cn-north-4a"}},
-    {"alarm_id": "ALM-SFS-008", "alarm_name": "SFS IO队列深度过高", "alarm_level": "MINOR", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-02", "metric": "sfs_io_queue_depth", "current_value": 256, "threshold": 128, "unit": "count", "first_occur_time": "2025-03-05T09:30:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 20, "description": "IO 队列深度 256", "tags": {"az": "cn-north-4a"}},
-    {"alarm_id": "ALM-SFS-009", "alarm_name": "SFS 连接数接近上限", "alarm_level": "WARNING", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-proxy-01", "metric": "sfs_active_connections", "current_value": 9500, "threshold": 10000, "unit": "count", "first_occur_time": "2025-03-05T09:40:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 12, "description": "活跃连接数 9500", "tags": {"az": "cn-north-4a"}},
-    {"alarm_id": "ALM-SFS-010", "alarm_name": "SFS 吞吐量下降", "alarm_level": "MAJOR", "alarm_source": "ANOMALY_DETECTION", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-01", "metric": "sfs_throughput_mbps", "current_value": 800, "threshold": 5000, "unit": "MBps", "first_occur_time": "2025-03-05T09:20:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 30, "description": "吞吐量降至 800MBps，下降 84%", "tags": {"az": "cn-north-4a", "direction": "read"}},
-    {"alarm_id": "ALM-SFS-011", "alarm_name": "SFS 吞吐量下降", "alarm_level": "MINOR", "alarm_source": "ANOMALY_DETECTION", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-02", "metric": "sfs_throughput_mbps", "current_value": 1200, "threshold": 5000, "unit": "MBps", "first_occur_time": "2025-03-05T09:25:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 25, "description": "吞吐量降至 1200MBps，下降 76%", "tags": {"az": "cn-north-4a", "direction": "read"}},
-    {"alarm_id": "ALM-SFS-012", "alarm_name": "SFS CPU使用率升高", "alarm_level": "WARNING", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "sfs-turbo-001", "instance_id": "sfs-node-01", "metric": "sfs_cpu_usage_percent", "current_value": 78.5, "threshold": 80.0, "unit": "%", "first_occur_time": "2025-03-05T09:35:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 15, "description": "CPU 使用率 78.5%，IO等待占比高", "tags": {"az": "cn-north-4a"}}
+    {"alarm_id": "ALM-EFS-001", "alarm_name": "EFS NFS读时延超阈值", "alarm_level": "CRITICAL", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-01", "metric": "efs_nfs_read_latency_ms", "current_value": 320.5, "threshold": 50.0, "unit": "ms", "first_occur_time": "2025-03-05T09:15:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 38, "description": "NFS 读操作 P99 时延 320.5ms，超过阈值 50ms", "tags": {"az": "cn-north-4a", "operation": "read", "protocol": "nfs"}},
+    {"alarm_id": "ALM-EFS-002", "alarm_name": "EFS NFS写时延超阈值", "alarm_level": "CRITICAL", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-01", "metric": "efs_nfs_write_latency_ms", "current_value": 580.2, "threshold": 100.0, "unit": "ms", "first_occur_time": "2025-03-05T09:18:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 35, "description": "NFS 写操作 P99 时延 580.2ms", "tags": {"az": "cn-north-4a", "operation": "write", "protocol": "nfs"}},
+    {"alarm_id": "ALM-EFS-003", "alarm_name": "EFS NFS读时延超阈值", "alarm_level": "MAJOR", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-02", "metric": "efs_nfs_read_latency_ms", "current_value": 280.3, "threshold": 50.0, "unit": "ms", "first_occur_time": "2025-03-05T09:20:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 30, "description": "NFS 读操作 P99 时延 280.3ms", "tags": {"az": "cn-north-4a", "operation": "read", "protocol": "nfs"}},
+    {"alarm_id": "ALM-EFS-004", "alarm_name": "EFS NFS写时延超阈值", "alarm_level": "MAJOR", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-02", "metric": "efs_nfs_write_latency_ms", "current_value": 490.7, "threshold": 100.0, "unit": "ms", "first_occur_time": "2025-03-05T09:22:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 28, "description": "NFS 写操作 P99 时延 490.7ms", "tags": {"az": "cn-north-4a", "operation": "write", "protocol": "nfs"}},
+    {"alarm_id": "ALM-EFS-005", "alarm_name": "EFS 后端OBS请求超时率升高", "alarm_level": "CRITICAL", "alarm_source": "ANOMALY_DETECTION", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-01", "metric": "efs_backend_obs_timeout_rate", "current_value": 0.15, "threshold": 0.01, "unit": "ratio", "first_occur_time": "2025-03-05T09:12:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 42, "description": "后端 OBS 请求超时率 15%", "tags": {"az": "cn-north-4a", "backend": "obs"}},
+    {"alarm_id": "ALM-EFS-006", "alarm_name": "EFS 后端OBS请求超时率升高", "alarm_level": "MAJOR", "alarm_source": "ANOMALY_DETECTION", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-02", "metric": "efs_backend_obs_timeout_rate", "current_value": 0.12, "threshold": 0.01, "unit": "ratio", "first_occur_time": "2025-03-05T09:14:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 38, "description": "后端 OBS 请求超时率 12%", "tags": {"az": "cn-north-4a", "backend": "obs"}},
+    {"alarm_id": "ALM-EFS-007", "alarm_name": "EFS IO队列深度过高", "alarm_level": "MAJOR", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-01", "metric": "efs_io_queue_depth", "current_value": 512, "threshold": 128, "unit": "count", "first_occur_time": "2025-03-05T09:25:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 25, "description": "IO 队列深度 512", "tags": {"az": "cn-north-4a"}},
+    {"alarm_id": "ALM-EFS-008", "alarm_name": "EFS IO队列深度过高", "alarm_level": "MINOR", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-02", "metric": "efs_io_queue_depth", "current_value": 256, "threshold": 128, "unit": "count", "first_occur_time": "2025-03-05T09:30:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 20, "description": "IO 队列深度 256", "tags": {"az": "cn-north-4a"}},
+    {"alarm_id": "ALM-EFS-009", "alarm_name": "EFS 连接数接近上限", "alarm_level": "WARNING", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-proxy-01", "metric": "efs_active_connections", "current_value": 9500, "threshold": 10000, "unit": "count", "first_occur_time": "2025-03-05T09:40:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 12, "description": "活跃连接数 9500", "tags": {"az": "cn-north-4a"}},
+    {"alarm_id": "ALM-EFS-010", "alarm_name": "EFS 吞吐量下降", "alarm_level": "MAJOR", "alarm_source": "ANOMALY_DETECTION", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-01", "metric": "efs_throughput_mbps", "current_value": 800, "threshold": 5000, "unit": "MBps", "first_occur_time": "2025-03-05T09:20:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 30, "description": "吞吐量降至 800MBps，下降 84%", "tags": {"az": "cn-north-4a", "direction": "read"}},
+    {"alarm_id": "ALM-EFS-011", "alarm_name": "EFS 吞吐量下降", "alarm_level": "MINOR", "alarm_source": "ANOMALY_DETECTION", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-02", "metric": "efs_throughput_mbps", "current_value": 1200, "threshold": 5000, "unit": "MBps", "first_occur_time": "2025-03-05T09:25:00Z", "last_occur_time": "2025-03-05T10:44:00Z", "occur_count": 25, "description": "吞吐量降至 1200MBps，下降 76%", "tags": {"az": "cn-north-4a", "direction": "read"}},
+    {"alarm_id": "ALM-EFS-012", "alarm_name": "EFS CPU使用率升高", "alarm_level": "WARNING", "alarm_source": "THRESHOLD", "status": "FIRING", "service_id": "efs-turbo-001", "instance_id": "efs-node-01", "metric": "efs_cpu_usage_percent", "current_value": 78.5, "threshold": 80.0, "unit": "%", "first_occur_time": "2025-03-05T09:35:00Z", "last_occur_time": "2025-03-05T10:45:00Z", "occur_count": 15, "description": "CPU 使用率 78.5%，IO等待占比高", "tags": {"az": "cn-north-4a"}}
   ]
 }
 ```
@@ -1000,12 +963,12 @@
 }
 ```
 
-#### Mock 调用 — SFS 告警聚类
+#### Mock 调用 — EFS 告警聚类
 
 **Agent 调用参数：**
 ```json
 {
-  "alarm_ids": ["ALM-SFS-001","ALM-SFS-002","ALM-SFS-003","ALM-SFS-004","ALM-SFS-005","ALM-SFS-006","ALM-SFS-007","ALM-SFS-008","ALM-SFS-009","ALM-SFS-010","ALM-SFS-011","ALM-SFS-012"],
+  "alarm_ids": ["ALM-EFS-001","ALM-EFS-002","ALM-EFS-003","ALM-EFS-004","ALM-EFS-005","ALM-EFS-006","ALM-EFS-007","ALM-EFS-008","ALM-EFS-009","ALM-EFS-010","ALM-EFS-011","ALM-EFS-012"],
   "time_range_start": "2025-03-05T09:00:00Z",
   "time_range_end": "2025-03-05T11:00:00Z",
   "algorithm": "AUTO"
@@ -1019,10 +982,10 @@
   "cluster_count": 4,
   "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
   "clusters": [
-    {"cluster_id": "CLU-SFS-001", "cluster_name": "NFS IO时延异常", "category": "IO_LATENCY", "severity": "CRITICAL", "alarm_count": 4, "alarm_ids": ["ALM-SFS-001","ALM-SFS-002","ALM-SFS-003","ALM-SFS-004"], "common_pattern": "NFS 读写 P99 时延大幅超阈值，涉及 sfs-node-01 和 sfs-node-02", "affected_instances": ["sfs-node-01","sfs-node-02"], "time_range": {"start": "2025-03-05T09:15:00Z", "end": "2025-03-05T10:45:00Z"}, "suggested_diagnosis_type": "IO_ANALYSIS"},
-    {"cluster_id": "CLU-SFS-002", "cluster_name": "OBS后端请求异常", "category": "DEPENDENCY", "severity": "CRITICAL", "alarm_count": 2, "alarm_ids": ["ALM-SFS-005","ALM-SFS-006"], "common_pattern": "后端 OBS 请求超时率异常升高，多节点同时出现", "affected_instances": ["sfs-node-01","sfs-node-02"], "time_range": {"start": "2025-03-05T09:12:00Z", "end": "2025-03-05T10:45:00Z"}, "suggested_diagnosis_type": "DEPENDENCY_CHECK"},
-    {"cluster_id": "CLU-SFS-003", "cluster_name": "IO队列积压与吞吐下降", "category": "IO_LATENCY", "severity": "MAJOR", "alarm_count": 4, "alarm_ids": ["ALM-SFS-007","ALM-SFS-008","ALM-SFS-010","ALM-SFS-011"], "common_pattern": "IO 队列积压 + 吞吐量大幅下降，属 IO 时延异常的伴生现象", "affected_instances": ["sfs-node-01","sfs-node-02"], "time_range": {"start": "2025-03-05T09:20:00Z", "end": "2025-03-05T10:45:00Z"}, "suggested_diagnosis_type": "IO_ANALYSIS"},
-    {"cluster_id": "CLU-SFS-004", "cluster_name": "资源使用率告警", "category": "RESOURCE", "severity": "WARNING", "alarm_count": 2, "alarm_ids": ["ALM-SFS-009","ALM-SFS-012"], "common_pattern": "连接数和 CPU 接近阈值，疑似 IO 积压连锁反应", "affected_instances": ["sfs-proxy-01","sfs-node-01"], "time_range": {"start": "2025-03-05T09:35:00Z", "end": "2025-03-05T10:45:00Z"}, "suggested_diagnosis_type": "RESOURCE_CHECK"}
+    {"cluster_id": "CLU-EFS-001", "cluster_name": "NFS IO时延异常", "category": "IO_LATENCY", "severity": "CRITICAL", "alarm_count": 4, "alarm_ids": ["ALM-EFS-001","ALM-EFS-002","ALM-EFS-003","ALM-EFS-004"], "common_pattern": "NFS 读写 P99 时延大幅超阈值，涉及 efs-node-01 和 efs-node-02", "affected_instances": ["efs-node-01","efs-node-02"], "time_range": {"start": "2025-03-05T09:15:00Z", "end": "2025-03-05T10:45:00Z"}, "suggested_diagnosis_type": "IO_ANALYSIS"},
+    {"cluster_id": "CLU-EFS-002", "cluster_name": "OBS后端请求异常", "category": "DEPENDENCY", "severity": "CRITICAL", "alarm_count": 2, "alarm_ids": ["ALM-EFS-005","ALM-EFS-006"], "common_pattern": "后端 OBS 请求超时率异常升高，多节点同时出现", "affected_instances": ["efs-node-01","efs-node-02"], "time_range": {"start": "2025-03-05T09:12:00Z", "end": "2025-03-05T10:45:00Z"}, "suggested_diagnosis_type": "DEPENDENCY_CHECK"},
+    {"cluster_id": "CLU-EFS-003", "cluster_name": "IO队列积压与吞吐下降", "category": "IO_LATENCY", "severity": "MAJOR", "alarm_count": 4, "alarm_ids": ["ALM-EFS-007","ALM-EFS-008","ALM-EFS-010","ALM-EFS-011"], "common_pattern": "IO 队列积压 + 吞吐量大幅下降，属 IO 时延异常的伴生现象", "affected_instances": ["efs-node-01","efs-node-02"], "time_range": {"start": "2025-03-05T09:20:00Z", "end": "2025-03-05T10:45:00Z"}, "suggested_diagnosis_type": "IO_ANALYSIS"},
+    {"cluster_id": "CLU-EFS-004", "cluster_name": "资源使用率告警", "category": "RESOURCE", "severity": "WARNING", "alarm_count": 2, "alarm_ids": ["ALM-EFS-009","ALM-EFS-012"], "common_pattern": "连接数和 CPU 接近阈值，疑似 IO 积压连锁反应", "affected_instances": ["efs-proxy-01","efs-node-01"], "time_range": {"start": "2025-03-05T09:35:00Z", "end": "2025-03-05T10:45:00Z"}, "suggested_diagnosis_type": "RESOURCE_CHECK"}
   ]
 }
 ```
@@ -1081,10 +1044,10 @@
 **Agent 调用参数：**
 ```json
 {
-  "service_id": "sfs-turbo-001",
-  "cluster_id": "CLU-SFS-001",
+  "service_id": "efs-turbo-001",
+  "cluster_id": "CLU-EFS-001",
   "diagnosis_type": "IO_ANALYSIS",
-  "alarm_ids": ["ALM-SFS-001","ALM-SFS-002","ALM-SFS-003","ALM-SFS-004"],
+  "alarm_ids": ["ALM-EFS-001","ALM-EFS-002","ALM-EFS-003","ALM-EFS-004"],
   "time_range_start": "2025-03-05T09:00:00Z",
   "time_range_end": "2025-03-05T11:00:00Z",
   "depth": "DEEP"
@@ -1094,7 +1057,7 @@
 **Mock 返回：**
 ```json
 {
-  "task_id": "DIAG-SFS-001",
+  "task_id": "DIAG-EFS-001",
   "status": "PENDING",
   "create_time": "2025-03-05T10:46:00Z",
   "estimated_duration_seconds": 210,
@@ -1134,21 +1097,21 @@
 }
 ```
 
-#### Mock 调用 A — SFS IO时延诊断（无根因）
+#### Mock 调用 A — EFS IO时延诊断（无根因）
 
 **Agent 调用参数：**
 ```json
-{"task_id": "DIAG-SFS-001", "time_range_start": "2025-03-05T09:00:00Z", "time_range_end": "2025-03-05T11:00:00Z"}
+{"task_id": "DIAG-EFS-001", "time_range_start": "2025-03-05T09:00:00Z", "time_range_end": "2025-03-05T11:00:00Z"}
 ```
 
 **Mock 返回：**
 ```json
 {
-  "task_id": "DIAG-SFS-001",
-  "task_name": "SFS NFS IO时延异常诊断",
+  "task_id": "DIAG-EFS-001",
+  "task_name": "EFS NFS IO时延异常诊断",
   "status": "COMPLETED",
-  "service_id": "sfs-turbo-001",
-  "cluster_id": "CLU-SFS-001",
+  "service_id": "efs-turbo-001",
+  "cluster_id": "CLU-EFS-001",
   "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
   "create_time": "2025-03-05T10:46:00Z",
   "complete_time": "2025-03-05T10:49:30Z",
@@ -1158,11 +1121,11 @@
     "root_cause": null,
     "root_cause_category": null,
     "evidence": [
-      {"type": "METRIC", "description": "本地磁盘时延正常", "data": {"metric": "sfs_local_disk_latency_ms", "value": 0.8, "baseline": 1.0}},
-      {"type": "METRIC", "description": "内部 RPC 时延正常", "data": {"metric": "sfs_internal_rpc_latency_ms", "value": 2.1, "baseline": 2.0}},
-      {"type": "METRIC", "description": "进程资源正常", "data": {"metric": "sfs_process_mem_usage_percent", "value": 45.2, "baseline": 42.0}}
+      {"type": "METRIC", "description": "本地磁盘时延正常", "data": {"metric": "efs_local_disk_latency_ms", "value": 0.8, "baseline": 1.0}},
+      {"type": "METRIC", "description": "内部 RPC 时延正常", "data": {"metric": "efs_internal_rpc_latency_ms", "value": 2.1, "baseline": 2.0}},
+      {"type": "METRIC", "description": "进程资源正常", "data": {"metric": "efs_process_mem_usage_percent", "value": 45.2, "baseline": 42.0}}
     ],
-    "impact": "NFS IO 时延异常非 SFS 自身引起",
+    "impact": "NFS IO 时延异常非 EFS 自身引起",
     "suggestion": "建议检查后端依赖服务（OBS），重点排查时延"
   },
   "steps": [
@@ -1174,11 +1137,11 @@
 }
 ```
 
-#### Mock 调用 B/C/D — SFS 其他 3 个聚类（均无根因，结构同上）
+#### Mock 调用 B/C/D — EFS 其他 3 个聚类（均无根因，结构同上）
 
-- **DIAG-SFS-002**（CLU-SFS-002 OBS依赖）→ `root_cause_found: false`，evidence: SFS→OBS P99=850ms
-- **DIAG-SFS-003**（CLU-SFS-003 IO队列）→ `root_cause_found: false`，evidence: 与OBS时延高度吻合
-- **DIAG-SFS-004**（CLU-SFS-004 资源）→ `root_cause_found: false`，evidence: CPU iowait主导
+- **DIAG-EFS-002**（CLU-EFS-002 OBS依赖）→ `root_cause_found: false`，evidence: EFS→OBS P99=850ms
+- **DIAG-EFS-003**（CLU-EFS-003 IO队列）→ `root_cause_found: false`，evidence: 与OBS时延高度吻合
+- **DIAG-EFS-004**（CLU-EFS-004 资源）→ `root_cause_found: false`，evidence: CPU iowait主导
 
 #### Mock 调用 E — OBS 慢盘诊断（✅ 找到根因）
 
@@ -1201,7 +1164,7 @@
   "result": {
     "root_cause_found": true,
     "confidence": 0.95,
-    "root_cause": "OBS 存储节点 obs-store-03 磁盘 sda 硬件劣化（慢盘），Reallocated Sector Count=156，SMART 健康评分 42%，导致 PUT/GET 时延从 5ms 升至 120ms+，影响 SFS Turbo 后端读写，最终导致 GPU 训练吞吐劣化",
+    "root_cause": "OBS 存储节点 obs-store-03 磁盘 sda 硬件劣化（慢盘），Reallocated Sector Count=156，SMART 健康评分 42%，导致 PUT/GET 时延从 5ms 升至 120ms+，影响 EFS Turbo 后端读写，最终导致 GPU 训练吞吐劣化",
     "root_cause_category": "HARDWARE_DEGRADATION",
     "evidence": [
       {"type": "METRIC", "description": "obs-store-03 磁盘时延 P99=120ms（基线 5ms）", "data": {"metric": "obs_disk_latency_p99_ms", "instance_id": "obs-store-03", "value": 120, "baseline": 5}},
@@ -1213,19 +1176,19 @@
       "obs-store-03 磁盘 sda 硬件劣化 (08:30)",
       "OBS 磁盘 IO 时延升至 120ms (08:55)",
       "OBS PUT/GET API 时延升高 (09:10)",
-      "SFS 后端 OBS 超时率升至 15% (09:12)",
-      "SFS NFS 读写时延超阈值 (09:15)",
-      "SFS IO 队列积压 (09:25)",
+      "EFS 后端 OBS 超时率升至 15% (09:12)",
+      "EFS NFS 读写时延超阈值 (09:15)",
+      "EFS IO 队列积压 (09:25)",
       "GPU 训练集群数据读取劣化 (09:30)"
     ],
-    "impact": "慢盘 → OBS 时延 → SFS 后端积压 → NFS 时延 → 训练吞吐下降",
+    "impact": "慢盘 → OBS 时延 → EFS 后端积压 → NFS 时延 → 训练吞吐下降",
     "suggestion": "1) 紧急: 迁移 obs-store-03 数据至健康节点; 2) 短期: 更换故障磁盘; 3) 长期: 加强 SMART 预测性监控"
   },
   "steps": [
     {"step_id": "S1", "step_name": "OBS网关检查", "status": "COMPLETED", "findings": "网关正常"},
     {"step_id": "S2", "step_name": "存储节点分析", "status": "COMPLETED", "findings": "obs-store-03 磁盘 P99=120ms，其他 < 5ms"},
     {"step_id": "S3", "step_name": "磁盘健康检查", "status": "COMPLETED", "findings": "sda Reallocated Sector=156，健康评分 42%"},
-    {"step_id": "S4", "step_name": "影响链路确认", "status": "COMPLETED", "findings": "时间线吻合: 08:30 SMART → 09:12 OBS超时 → 09:15 SFS时延"}
+    {"step_id": "S4", "step_name": "影响链路确认", "status": "COMPLETED", "findings": "时间线吻合: 08:30 SMART → 09:12 OBS超时 → 09:15 EFS时延"}
   ]
 }
 ```
@@ -1385,12 +1348,12 @@
 }
 ```
 
-#### Mock 调用 A — SFS 指标异常检测
+#### Mock 调用 A — EFS 指标异常检测
 
 **Agent 调用参数：**
 ```json
 {
-  "service_id": "sfs-turbo-001",
+  "service_id": "efs-turbo-001",
   "time_range_start": "2025-03-05T09:00:00Z",
   "time_range_end": "2025-03-05T11:00:00Z",
   "sensitivity": "MEDIUM"
@@ -1400,14 +1363,14 @@
 **Mock 返回：**
 ```json
 {
-  "service_id": "sfs-turbo-001",
+  "service_id": "efs-turbo-001",
   "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
   "total_metrics_checked": 42,
   "anomaly_count": 8,
   "anomalies": [
     {
-      "metric_name": "sfs_nfs_read_latency_ms",
-      "instance_id": "sfs-node-01",
+      "metric_name": "efs_nfs_read_latency_ms",
+      "instance_id": "efs-node-01",
       "anomaly_type": "SPIKE",
       "severity": "CRITICAL",
       "current_value": 320.5,
@@ -1418,8 +1381,8 @@
       "description": "NFS 读时延飙升至基线 32 倍"
     },
     {
-      "metric_name": "sfs_backend_obs_timeout_rate",
-      "instance_id": "sfs-node-01",
+      "metric_name": "efs_backend_obs_timeout_rate",
+      "instance_id": "efs-node-01",
       "anomaly_type": "SPIKE",
       "severity": "CRITICAL",
       "current_value": 0.15,
@@ -1430,8 +1393,8 @@
       "description": "OBS 后端超时率飙升至基线 150 倍"
     },
     {
-      "metric_name": "sfs_throughput_mbps",
-      "instance_id": "sfs-node-01",
+      "metric_name": "efs_throughput_mbps",
+      "instance_id": "efs-node-01",
       "anomaly_type": "DROP",
       "severity": "MAJOR",
       "current_value": 800,
@@ -1442,8 +1405,8 @@
       "description": "吞吐量下降 84%"
     },
     {
-      "metric_name": "sfs_io_queue_depth",
-      "instance_id": "sfs-node-01",
+      "metric_name": "efs_io_queue_depth",
+      "instance_id": "efs-node-01",
       "anomaly_type": "SPIKE",
       "severity": "MAJOR",
       "current_value": 512,
@@ -1458,9 +1421,9 @@
     {
       "fault_type": "BACKEND_DEPENDENCY_DEGRADATION",
       "confidence": 0.85,
-      "description": "后端 OBS 依赖异常导致 SFS IO 链路整体劣化",
-      "related_anomalies": ["sfs_backend_obs_timeout_rate", "sfs_nfs_read_latency_ms", "sfs_throughput_mbps", "sfs_io_queue_depth"],
-      "affected_instances": ["sfs-node-01", "sfs-node-02"],
+      "description": "后端 OBS 依赖异常导致 EFS IO 链路整体劣化",
+      "related_anomalies": ["efs_backend_obs_timeout_rate", "efs_nfs_read_latency_ms", "efs_throughput_mbps", "efs_io_queue_depth"],
+      "affected_instances": ["efs-node-01", "efs-node-02"],
       "suggestion": "优先排查下游 OBS 服务状态"
     }
   ]
@@ -1564,7 +1527,7 @@
       "properties": {
         "service_type": {
           "type": "string",
-          "enum": ["SFS_TURBO", "OBS", "ECS", "EVS", "VPC"]
+          "enum": ["EFS_TURBO", "OBS", "ECS", "EVS", "VPC", "EFS_CLUSTER"]
         },
         "time_range_start": {
           "type": "string",
@@ -1589,27 +1552,27 @@
 
 **Agent 调用参数：**
 ```json
-{"service_type": "SFS_TURBO", "time_range_start": "2025-03-05T09:00:00Z", "time_range_end": "2025-03-05T11:00:00Z"}
+{"service_type": "EFS_TURBO", "time_range_start": "2025-03-05T09:00:00Z", "time_range_end": "2025-03-05T11:00:00Z"}
 ```
 
 **Mock 返回：**
 ```json
 {
-  "service_type": "SFS_TURBO",
+  "service_type": "EFS_TURBO",
   "config_version": "v2.3",
   "effective_time": "2025-02-01T00:00:00Z",
   "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
   "metrics": [
-    {"metric_name": "sfs_nfs_read_latency_ms",     "display_name": "NFS 读时延",     "unit": "ms",    "category": "PERFORMANCE", "baseline": 10,   "threshold_warning": 30,   "threshold_critical": 50},
-    {"metric_name": "sfs_nfs_write_latency_ms",    "display_name": "NFS 写时延",     "unit": "ms",    "category": "PERFORMANCE", "baseline": 20,   "threshold_warning": 60,   "threshold_critical": 100},
-    {"metric_name": "sfs_throughput_mbps",          "display_name": "吞吐量",         "unit": "MBps",  "category": "PERFORMANCE", "baseline": 5000, "threshold_warning": 2000, "threshold_critical": 1000},
-    {"metric_name": "sfs_backend_obs_timeout_rate", "display_name": "OBS后端超时率",  "unit": "ratio", "category": "AVAILABILITY","baseline": 0.001,"threshold_warning": 0.005,"threshold_critical": 0.01},
-    {"metric_name": "sfs_obs_call_latency_p99_ms", "display_name": "OBS调用P99时延", "unit": "ms",    "category": "PERFORMANCE", "baseline": 50,   "threshold_warning": 30,   "threshold_critical": 100},
-    {"metric_name": "sfs_io_queue_depth",           "display_name": "IO队列深度",     "unit": "count", "category": "PERFORMANCE", "baseline": 16,   "threshold_warning": 64,   "threshold_critical": 128},
-    {"metric_name": "sfs_active_connections",       "display_name": "活跃连接数",     "unit": "count", "category": "RESOURCE",    "baseline": 3000, "threshold_warning": 8000, "threshold_critical": 10000},
-    {"metric_name": "sfs_cpu_usage_percent",        "display_name": "CPU使用率",      "unit": "%",     "category": "RESOURCE",    "baseline": 40,   "threshold_warning": 80,   "threshold_critical": 95},
-    {"metric_name": "sfs_local_disk_latency_ms",    "display_name": "本地磁盘时延",   "unit": "ms",    "category": "PERFORMANCE", "baseline": 1,    "threshold_warning": 5,    "threshold_critical": 20},
-    {"metric_name": "sfs_internal_rpc_latency_ms",  "display_name": "内部RPC时延",    "unit": "ms",    "category": "NETWORK",     "baseline": 2,    "threshold_warning": 5,    "threshold_critical": 10}
+    {"metric_name": "efs_nfs_read_latency_ms",     "display_name": "NFS 读时延",     "unit": "ms",    "category": "PERFORMANCE", "baseline": 10,   "threshold_warning": 30,   "threshold_critical": 50},
+    {"metric_name": "efs_nfs_write_latency_ms",    "display_name": "NFS 写时延",     "unit": "ms",    "category": "PERFORMANCE", "baseline": 20,   "threshold_warning": 60,   "threshold_critical": 100},
+    {"metric_name": "efs_throughput_mbps",          "display_name": "吞吐量",         "unit": "MBps",  "category": "PERFORMANCE", "baseline": 5000, "threshold_warning": 2000, "threshold_critical": 1000},
+    {"metric_name": "efs_backend_obs_timeout_rate", "display_name": "OBS后端超时率",  "unit": "ratio", "category": "AVAILABILITY","baseline": 0.001,"threshold_warning": 0.005,"threshold_critical": 0.01},
+    {"metric_name": "efs_obs_call_latency_p99_ms", "display_name": "OBS调用P99时延", "unit": "ms",    "category": "PERFORMANCE", "baseline": 50,   "threshold_warning": 30,   "threshold_critical": 100},
+    {"metric_name": "efs_io_queue_depth",           "display_name": "IO队列深度",     "unit": "count", "category": "PERFORMANCE", "baseline": 16,   "threshold_warning": 64,   "threshold_critical": 128},
+    {"metric_name": "efs_active_connections",       "display_name": "活跃连接数",     "unit": "count", "category": "RESOURCE",    "baseline": 3000, "threshold_warning": 8000, "threshold_critical": 10000},
+    {"metric_name": "efs_cpu_usage_percent",        "display_name": "CPU使用率",      "unit": "%",     "category": "RESOURCE",    "baseline": 40,   "threshold_warning": 80,   "threshold_critical": 95},
+    {"metric_name": "efs_local_disk_latency_ms",    "display_name": "本地磁盘时延",   "unit": "ms",    "category": "PERFORMANCE", "baseline": 1,    "threshold_warning": 5,    "threshold_critical": 20},
+    {"metric_name": "efs_internal_rpc_latency_ms",  "display_name": "内部RPC时延",    "unit": "ms",    "category": "NETWORK",     "baseline": 2,    "threshold_warning": 5,    "threshold_critical": 10}
   ]
 }
 ```
@@ -1737,7 +1700,7 @@
 
 **Agent 调用参数：**
 ```json
-{"log_id": "LOG-SFS-10001", "time_range_start": "2025-03-05T09:00:00Z", "time_range_end": "2025-03-05T11:00:00Z", "before_count": 3, "after_count": 2}
+{"log_id": "LOG-EFS-10001", "time_range_start": "2025-03-05T09:00:00Z", "time_range_end": "2025-03-05T11:00:00Z", "before_count": 3, "after_count": 2}
 ```
 
 **Mock 返回：**
@@ -1745,20 +1708,20 @@
 {
   "time_range": {"start": "2025-03-05T09:00:00Z", "end": "2025-03-05T11:00:00Z"},
   "target_log": {
-    "log_id": "LOG-SFS-10001",
+    "log_id": "LOG-EFS-10001",
     "timestamp": "2025-03-05T10:44:58Z",
     "level": "ERROR",
-    "instance_id": "sfs-node-01",
+    "instance_id": "efs-node-01",
     "message": "OBS PUT request timeout after 30s, bucket=train-data-bucket, key=checkpoint/model_step_50000.bin, retry=3/3"
   },
   "before_logs": [
-    {"log_id": "LOG-SFS-09998", "timestamp": "2025-03-05T10:44:55Z", "level": "WARN",  "instance_id": "sfs-node-01", "message": "OBS PUT request retry, attempt=2/3, elapsed=20150ms"},
-    {"log_id": "LOG-SFS-09995", "timestamp": "2025-03-05T10:44:42Z", "level": "WARN",  "instance_id": "sfs-node-01", "message": "OBS PUT request retry, attempt=1/3, elapsed=10080ms"},
-    {"log_id": "LOG-SFS-09990", "timestamp": "2025-03-05T10:44:28Z", "level": "INFO",  "instance_id": "sfs-node-01", "message": "OBS PUT request started, bucket=train-data-bucket, key=checkpoint/model_step_50000.bin, size=2147483648"}
+    {"log_id": "LOG-EFS-09998", "timestamp": "2025-03-05T10:44:55Z", "level": "WARN",  "instance_id": "efs-node-01", "message": "OBS PUT request retry, attempt=2/3, elapsed=20150ms"},
+    {"log_id": "LOG-EFS-09995", "timestamp": "2025-03-05T10:44:42Z", "level": "WARN",  "instance_id": "efs-node-01", "message": "OBS PUT request retry, attempt=1/3, elapsed=10080ms"},
+    {"log_id": "LOG-EFS-09990", "timestamp": "2025-03-05T10:44:28Z", "level": "INFO",  "instance_id": "efs-node-01", "message": "OBS PUT request started, bucket=train-data-bucket, key=checkpoint/model_step_50000.bin, size=2147483648"}
   ],
   "after_logs": [
-    {"log_id": "LOG-SFS-10010", "timestamp": "2025-03-05T10:45:00Z", "level": "ERROR", "instance_id": "sfs-node-01", "message": "Checkpoint write failed, will retry in 60s, file=model_step_50000.bin"},
-    {"log_id": "LOG-SFS-10011", "timestamp": "2025-03-05T10:45:02Z", "level": "WARN",  "instance_id": "sfs-node-01", "message": "Client NFS WRITE callback delayed, client=192.168.2.50, delay=325ms"}
+    {"log_id": "LOG-EFS-10010", "timestamp": "2025-03-05T10:45:00Z", "level": "ERROR", "instance_id": "efs-node-01", "message": "Checkpoint write failed, will retry in 60s, file=model_step_50000.bin"},
+    {"log_id": "LOG-EFS-10011", "timestamp": "2025-03-05T10:45:02Z", "level": "WARN",  "instance_id": "efs-node-01", "message": "Client NFS WRITE callback delayed, client=192.168.2.50, delay=325ms"}
   ]
 }
 ```
@@ -1847,17 +1810,23 @@ def agent_diagnose(trigger_alarm):
                 evidence_logs = query_logs(...)
                 return build_report(result, evidence_metrics, evidence_logs, anomalies)
 
-        # 5. 全部无根因 → 从 topology 返回的依赖中选择嫌疑最大的
+        # 5. 全部无根因 → 先检查 cluster 下的 obs_backend，再检查 downstream_dependencies
         #    同时参考 anomalies.possible_faults 辅助判断
         if not root_cause_found:
-            deps = topology["downstream_dependencies"]
-            suspect = pick_most_suspicious(deps)  # status=DEGRADED + STRONG 优先
-            if suspect:
-                service_id = suspect["service_id"]
-                # OBS 异常可能比 SFS 告警更早，向前扩展时间窗
+            # 优先检查 EFS cluster 下挂的 OBS 后端（可选）
+            obs = topology.get("efs_cluster", {}).get("obs_backend")
+            if obs and obs["status"] == "DEGRADED":
+                service_id = obs["bucket_id"]
                 window_start = window_start - timedelta(minutes=30)
             else:
-                break
+                # 其次检查 downstream_dependencies
+                deps = topology["downstream_dependencies"]
+                suspect = pick_most_suspicious(deps)  # status=DEGRADED + STRONG 优先
+                if suspect:
+                    service_id = suspect["service_id"]
+                    window_start = window_start - timedelta(minutes=30)
+                else:
+                    break
 
     return {"root_cause": None, "message": "未能自动定位根因"}
 ```
@@ -1866,25 +1835,49 @@ def agent_diagnose(trigger_alarm):
 
 ## 6. 关键指标速查
 
-### SFS Turbo
+### EFS Turbo
 
 | 指标 | 基线 | 告警阈值 |
 |------|------|----------|
-| sfs_nfs_read_latency_ms | < 10ms | > 50ms |
-| sfs_nfs_write_latency_ms | < 20ms | > 100ms |
-| sfs_throughput_mbps | > 5000 | < 1000 |
-| sfs_backend_obs_timeout_rate | < 0.1% | > 1% |
-| sfs_obs_call_latency_p99_ms | < 50ms | > 100ms |
-| sfs_io_queue_depth | < 32 | > 128 |
-| sfs_local_disk_latency_ms | < 1ms | > 20ms |
-| sfs_internal_rpc_latency_ms | < 2ms | > 10ms |
+| efs_nfs_read_latency_ms | < 10ms | > 50ms |
+| efs_nfs_write_latency_ms | < 20ms | > 100ms |
+| efs_throughput_mbps | > 5000 | < 1000 |
+| efs_backend_obs_timeout_rate | < 0.1% | > 1% |
+| efs_obs_call_latency_p99_ms | < 50ms | > 100ms |
+| efs_io_queue_depth | < 32 | > 128 |
+| efs_local_disk_latency_ms | < 1ms | > 20ms |
+| efs_internal_rpc_latency_ms | < 2ms | > 10ms |
 
-### OBS
+### ECS（关联实例）
 
 | 指标 | 基线 | 告警阈值 |
 |------|------|----------|
-| obs_get_latency_p99_ms | < 5ms | > 30ms |
-| obs_put_latency_p99_ms | < 10ms | > 50ms |
+| cpu_util | < 40% | > 80% |
+| mem_util | < 60% | > 90% |
+| network_incoming_bytes_rate | - | 按带宽规格 |
+| network_outgoing_bytes_rate | - | 按带宽规格 |
+| sys_disk_usage_percent | < 60% | > 85% |
+
+### EVS（iostat 指标）
+
+| 指标 | 基线 | 告警阈值 |
+|------|------|----------|
+| disk_io_await_ms | < 1ms | > 20ms |
+| disk_read_bytes_rate | - | 按磁盘规格 |
+| disk_write_bytes_rate | - | 按磁盘规格 |
+| disk_io_size_kb | - | 参考值 |
+| disk_iops | - | 按磁盘规格 |
+| disk_util | < 50% | > 90% |
+
+### OBS（可选，挂在 EFS cluster 下）
+
+| 指标 | 基线 | 告警阈值 |
+|------|------|----------|
+| download_bytes_per_sec (bps) | - | 按桶配额 |
+| upload_bytes_per_sec (bps) | - | 按桶配额 |
+| request_count_per_sec (tps) | - | 按桶配额 |
+| get_latency_p99 | < 5ms | > 30ms |
+| put_latency_p99 | < 10ms | > 50ms |
 | obs_disk_latency_p99_ms | < 5ms | > 10ms |
 | obs_disk_smart_health_score | > 95% | < 60% |
 | obs_5xx_error_rate | < 0.01% | > 1% |
