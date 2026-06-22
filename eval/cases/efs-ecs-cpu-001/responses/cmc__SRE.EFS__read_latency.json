@@ -1,0 +1,8 @@
+{
+  "origin_response": {
+    "description": "tool执行结果",
+    "content": [
+      {"instance_id": "nas-01", "metric": "read_latency", "max": 40, "datapoints": [{"ts": 1774410800000, "value": 40}]}
+    ]
+  }
+}

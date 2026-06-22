@@ -1,0 +1,15 @@
+{
+  "origin_response": {
+    "description": "tool执行结果",
+    "content": {
+      "csn": "ALM-20260615-1423",
+      "cluster_id": "cl-efs-001",
+      "instance_id": "nas-01",
+      "region": "cn-north-7",
+      "firstOccurUtc": 1774410821414,
+      "severity": "critical",
+      "alarm_status": "active",
+      "additionalInformation": "original_data={\"avg_write_latency:last()>=500\":1001.899,\"avg_read_latency:last()>=500\":5.791}"
+    }
+  }
+}

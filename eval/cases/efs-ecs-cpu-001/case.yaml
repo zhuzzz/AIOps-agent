@@ -1,0 +1,51 @@
+case_id: efs-ecs-cpu-001
+skill: efs-diagnosis
+fault_type: ecs_cpu_bottleneck
+description: >
+  SFS Turbo IO 读写时延告警；逐层排除 nas/space/mds/OBS/EVS 均正常，
+  唯 ECS 实例 ecs-02 的 cpu_util 峰值 92% 越过 80% 阈值 —— 根因为 ECS CPU 瓶颈。
+  决定性证据 = Step8 的 SYS.ECS/cpu_util 越界。
+
+# Skill 的输入（告警流水号）
+input:
+  csn: "ALM-20260615-1423"
+
+# === SRE 盖章的期望根因（绝不从告警指标反推）===
+# 告警指标只是症状(IO时延高)；根因由下游 cpu_util 判定，必须人工盖章。
+expected_root_cause:
+  exactly: 1
+  causes:
+    - category: ECS_CPU
+      resource_id: ecs-02
+      evidence: "cpu_util 峰值 92% > 80%"
+
+# === Tier2 参考轨迹：necessary=必经，decisive=决定性；不强制顺序 ===
+reference_trajectory:
+  - tool: monitor_cma_get_current_alarms
+    necessary: true
+    decisive: false
+  - tool: monitor_smarttopo_get_efs_topology
+    necessary: true
+    decisive: false
+  - tool: monitor_cmc_get_tenant_metric_data
+    name_space: SYS.ECS
+    metric: cpu_util
+    necessary: true
+    decisive: true        # ← 区分 ECS-CPU 与其它 5 类根因的那一步
+
+# === Tier3 结果的二级关键词确认 ===
+expected_conclusion:
+  must_mention: ["CPU", "cpu_util", "80", "ecs-02"]
+
+# === Tier1 通用规则（与具体根因无关的硬门禁）===
+rules:
+  schema: recommended_root_cause
+  require_instance_id: true
+  # 正确的 ECS-CPU 结论里不应出现这些相互矛盾/越界的类别词
+  must_not: ["mds", "OBS", "带宽限流", "QOS限流"]
+  forbidden_tools: []
+
+# === 回归门禁阈值 ===
+gates:
+  f1_gate: 1.0
+  decisive_gate: 1.0

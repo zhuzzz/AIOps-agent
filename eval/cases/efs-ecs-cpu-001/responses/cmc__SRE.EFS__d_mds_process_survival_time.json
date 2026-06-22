@@ -1,0 +1,8 @@
+{
+  "origin_response": {
+    "description": "tool执行结果",
+    "content": [
+      {"instance_id": "mds-01", "metric": "d_mds_process_survival_time", "max": 99999, "datapoints": [{"ts": 1774410800000, "value": 99999}]}
+    ]
+  }
+}
