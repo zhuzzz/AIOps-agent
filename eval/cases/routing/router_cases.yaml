@@ -1,0 +1,20 @@
+# 路由层最小样例：命中 / 竞争 / 拒识 / 误路由 各一条
+- id: route-efs-io-001
+  alarm_text: "SFS Turbo 实例 IO 读写时延告警，疑似 QOS 限流"
+  resource_type: "efs::sfs-turbo"
+  expected_skill: efs-diagnosis        # 正确命中
+
+- id: route-db-competition-001
+  alarm_text: "RDS MySQL 慢查询激增，连接数打满"
+  resource_type: "rds::mysql"
+  expected_skill: db-diagnosis         # 多 skill 竞争：efs 不应抢走
+
+- id: route-reject-vague-001
+  alarm_text: "某主机磁盘时延略升，无明确服务归属"
+  resource_type: ""
+  expected_skill: null                 # 应拒识（任何 skill 都不该硬接）
+
+- id: route-misroute-qos-001
+  alarm_text: "网络QOS策略变更通知（与存储无关）"
+  resource_type: ""
+  expected_skill: null                 # 仅因撞到 'QOS' 关键词而误路由 —— 过度自信

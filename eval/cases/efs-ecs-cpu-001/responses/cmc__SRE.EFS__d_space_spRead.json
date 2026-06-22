@@ -1,0 +1,8 @@
+{
+  "origin_response": {
+    "description": "tool执行结果",
+    "content": [
+      {"instance_id": "space-01", "metric": "d_space_spRead", "max": 8, "datapoints": [{"ts": 1774410800000, "value": 8}]}
+    ]
+  }
+}

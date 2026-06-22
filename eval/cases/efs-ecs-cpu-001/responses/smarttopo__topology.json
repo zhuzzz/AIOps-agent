@@ -1,0 +1,13 @@
+{
+  "origin_response": {
+    "description": "tool执行结果",
+    "content": {
+      "cluster_id": "cl-efs-001",
+      "nas_instances": [{"resource_id": "nas-01"}],
+      "mds_instances": [{"resource_id": "mds-01"}],
+      "space_instances": [{"resource_id": "space-01"}],
+      "ecs_instances": [{"resource_id": "ecs-01"}, {"resource_id": "ecs-02"}],
+      "evs_instances": [{"resource_id": "evs-01"}]
+    }
+  }
+}

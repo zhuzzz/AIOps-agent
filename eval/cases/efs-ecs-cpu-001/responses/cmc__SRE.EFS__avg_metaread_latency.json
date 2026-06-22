@@ -1,0 +1,8 @@
+{
+  "origin_response": {
+    "description": "tool执行结果",
+    "content": [
+      {"instance_id": "mds-01", "metric": "avg_metaread_latency", "max": 6, "datapoints": [{"ts": 1774410800000, "value": 6}]}
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "origin_response": {
+    "description": "tool执行结果",
+    "content": [
+      {"instance_id": "ecs-01", "metric": "cpu_util", "max": 35.0, "datapoints": [{"ts": 1774410800000, "value": 35.0}]},
+      {"instance_id": "ecs-02", "metric": "cpu_util", "max": 92.0, "datapoints": [{"ts": 1774410800000, "value": 92.0}]}
+    ]
+  }
+}

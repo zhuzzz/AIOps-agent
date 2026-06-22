@@ -1,0 +1,8 @@
+{
+  "origin_response": {
+    "description": "tool执行结果",
+    "content": [
+      {"instance_id": "evs-01", "metrics": {"disk_device_read_await": 4.0, "disk_device_write_await": 5.0}}
+    ]
+  }
+}
